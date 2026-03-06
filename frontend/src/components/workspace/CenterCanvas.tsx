@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Image from "next/image";
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 
 import { FileUploader } from "@/components/analysis/FileUploader";

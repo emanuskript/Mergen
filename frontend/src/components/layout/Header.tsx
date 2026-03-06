@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import Image from "next/image";
 import { useAtomValue, useSetAtom } from "jotai";
 import { HelpCircle } from "lucide-react";
 
@@ -65,9 +66,15 @@ export function Header() {
   return (
     <header className="sticky top-0 z-40 h-14 border-b bg-background/95 backdrop-blur-sm">
       <div className="flex h-full items-center justify-between px-4">
-        {/* Left: title */}
-        <Link href="/analyze" className="text-lg font-bold tracking-tight">
-          Manuscript Layout Analysis
+        <Link href="/analyze" className="mr-1 flex items-center">
+          <Image
+            src="/mergen.png"
+            alt="Mergen"
+            width={300}
+            height={60}
+            priority
+            className="h-10 w-auto"
+          />
         </Link>
 
         {/* Right: actions */}

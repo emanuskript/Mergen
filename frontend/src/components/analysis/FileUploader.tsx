@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback } from "react";
+import Image from "next/image";
 import { useDropzone } from "react-dropzone";
 
 interface FileUploaderProps {
@@ -38,7 +39,7 @@ export function FileUploader({ file, onFileChange }: FileUploaderProps) {
   return (
     <div
       {...getRootProps()}
-      className={`cursor-pointer rounded-lg border-2 border-dashed p-6 text-center transition-colors ${
+      className={`relative cursor-pointer rounded-lg border-2 border-dashed p-6 text-center transition-colors ${
         isDragActive
           ? "border-primary bg-primary/5"
           : "border-muted-foreground/25 hover:border-primary/50"
@@ -67,6 +68,17 @@ export function FileUploader({ file, onFileChange }: FileUploaderProps) {
         </div>
       ) : (
         <div>
+          <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center -translate-y-[257px]">
+            <Image
+              src="/mergen.png"
+              alt="Mergen"
+              width={520}
+              height={180}
+              priority
+              className="h-auto w-full max-w-[360px] opacity-15"
+            />
+          </div>
+          <div className="relative z-10">
           <svg className="mx-auto mb-2 h-8 w-8 text-muted-foreground/40" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
           </svg>
@@ -76,6 +88,7 @@ export function FileUploader({ file, onFileChange }: FileUploaderProps) {
           <p className="mt-1 text-xs text-muted-foreground">
             Image for single analysis, ZIP for batch
           </p>
+          </div>
         </div>
       )}
     </div>
