@@ -5,6 +5,9 @@ set -euo pipefail
 
 SITE="${1:-:80}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR=""
+
 echo "==> Installing Docker (if missing)..."
 if ! command -v docker &>/dev/null; then
   curl -fsSL https://get.docker.com | sh
@@ -13,11 +16,20 @@ if ! command -v docker &>/dev/null; then
   exit 0
 fi
 
-echo "==> Cloning repo..."
-if [ ! -d layout ]; then
-  git clone https://github.com/emanuskript/layout.git
+echo "==> Resolving repository path..."
+if [ -f "$SCRIPT_DIR/docker-compose.yml" ] && [ -d "$SCRIPT_DIR/backend" ]; then
+  REPO_DIR="$SCRIPT_DIR"
+elif [ -f "$PWD/docker-compose.yml" ] && [ -d "$PWD/backend" ]; then
+  REPO_DIR="$PWD"
+elif [ -d "$PWD/layout" ] && [ -f "$PWD/layout/docker-compose.yml" ] && [ -d "$PWD/layout/backend" ]; then
+  REPO_DIR="$PWD/layout"
+else
+  echo "==> Cloning repo..."
+  git clone https://github.com/emanuskript/layout.git "$PWD/layout"
+  REPO_DIR="$PWD/layout"
 fi
-cd layout
+
+cd "$REPO_DIR"
 
 echo "==> Checking for model weights..."
 if [ ! -f backend/models/best_catmus.pt ]; then
