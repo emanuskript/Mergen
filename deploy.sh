@@ -97,7 +97,6 @@ disable_conflicting_services() {
 disable_old_public_configs() {
   log "Disabling old public nginx configs..."
   sudo mkdir -p /etc/nginx/disabled-by-layout
-
   sudo rm -f /etc/nginx/sites-enabled/* || true
 
   while IFS= read -r -d '' f; do
@@ -161,11 +160,16 @@ server {
     server_name _;
 
     client_max_body_size 200M;
-    add_header Cache-Control "no-store, no-cache, must-revalidate, max-age=0" always;
+
+    location = /api {
+        return 301 /api/;
+    }
 
     location ^~ /api/ {
         proxy_pass http://127.0.0.1:${BACKEND_PORT}/api/;
         proxy_http_version 1.1;
+        proxy_request_buffering off;
+        proxy_buffering off;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -218,14 +222,19 @@ verify_local_nginx() {
     || fail "Local nginx is not serving the expected frontend."
 }
 
+verify_api() {
+  curl -fsS "http://127.0.0.1/api/health" >/dev/null \
+    || fail "nginx -> backend health route is broken."
+  curl -fsS "http://127.0.0.1/api/classes" >/dev/null \
+    || fail "nginx -> backend classes route is broken."
+}
+
 verify_public_route() {
   if curl -fsS "http://${PUBLIC_IP}" | grep -q "${APP_TITLE}"; then
     log "Public IP is serving the expected frontend."
   else
     echo
     echo "!! Local deployment is correct, but public IP is not serving the same frontend."
-    echo "!! This usually means external routing / NAT / DNS is still pointing to an old public setup."
-    echo "!! Local nginx is correct. Public URL may still be handled outside this VM."
   fi
 }
 
@@ -280,7 +289,7 @@ if [ -f package-lock.json ]; then
 else
   TMPDIR="$TMP_ROOT" npm install --cache "$TMP_ROOT/.npm-cache"
 fi
-BACKEND_URL="/api" NEXT_PUBLIC_BACKEND_URL="/api" TMPDIR="$TMP_ROOT" npm run build
+BACKEND_URL="http://127.0.0.1:${BACKEND_PORT}" TMPDIR="$TMP_ROOT" npm run build
 cd "$REPO_DIR"
 
 log "Writing services and nginx config..."
@@ -309,6 +318,7 @@ sudo systemctl is-active --quiet nginx || fail "nginx not active."
 
 verify_local_frontend
 verify_local_nginx
+verify_api
 verify_public_route
 
 echo
