@@ -34,6 +34,9 @@ detect_repo_dir() {
   if [ -d "$PWD/layout/.git" ] && [ -d "$PWD/layout/backend" ] && [ -d "$PWD/layout/frontend" ]; then
     echo "$PWD/layout"; return
   fi
+  if [ -d "$PWD/Mergen/.git" ] && [ -d "$PWD/Mergen/backend" ] && [ -d "$PWD/Mergen/frontend" ]; then
+    echo "$PWD/Mergen"; return
+  fi
   echo ""
 }
 
@@ -247,8 +250,8 @@ sudo apt-get install -y --no-install-recommends \
 log "Resolving repository path..."
 REPO_DIR="$(detect_repo_dir)"
 if [ -z "$REPO_DIR" ]; then
-  git clone https://github.com/emanuskript/layout.git "$PWD/layout"
-  REPO_DIR="$PWD/layout"
+  git clone https://github.com/emanuskript/Mergen.git "$PWD/Mergen"
+  REPO_DIR="$PWD/Mergen"
 fi
 cd "$REPO_DIR"
 

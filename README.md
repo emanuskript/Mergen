@@ -1,213 +1,185 @@
-# Medieval Manuscript Layout Analysis
+# Mergen
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Gradio](https://img.shields.io/badge/Gradio-5.23.1-orange.svg)](https://gradio.app/)
+Mergen is a full-stack manuscript layout analysis app that runs three YOLO models in parallel, combines results into a unified annotation set, and provides interactive review and export tools.
 
-> **A Gradio-based web application for manuscript layout analysis using three combined YOLO models: emanuskript, catmus, and zone.**
+## What the app does
 
-![Architecture](https://img.shields.io/badge/Models-3%20YOLO-green)
-![Classes](https://img.shields.io/badge/Classes-25-purple)
+- Detects manuscript layout/content elements with 3 models: emanuskript, catmus, zone.
+- Supports single-image and batch ZIP workflows.
+- Returns unified COCO annotations with class filtering.
+- Produces annotated image previews and aggregate statistics.
+- Exports COCO JSON, annotated images, ZIP bundles, and PAGE XML.
+- Includes authenticated analytics endpoints for usage reporting.
 
----
+## Tech stack
 
-## 🎯 Overview
+- Frontend: Next.js 16 (App Router), React 19, TypeScript.
+- Backend: FastAPI + Uvicorn.
+- Inference: Ultralytics YOLO models executed in multiprocessing pool.
+- Reverse proxy (container deployment): Caddy.
+- Alternative host deployment: systemd + nginx via deploy.sh.
 
-This application provides a web-based interface for analyzing medieval manuscript images using three specialized ML models. It combines predictions from multiple models into a unified COCO-format output.
+## Model weights
 
-### Key Features
+Download all required model weights from OwnCloud:
 
-- **Multi-Model Inference**: Runs 3 YOLO models in parallel using multiprocessing
-- **COCO Format Output**: Standard COCO JSON annotations for interoperability
-- **Interactive Filtering**: Filter results by 25 predefined manuscript element classes
-- **Batch Processing**: Process entire ZIP archives of images
-- **Visual Overlays**: Color-coded annotations with semi-transparent fills
-- **Statistics**: Per-image and aggregate statistics with graphs
-- **Analytics Dashboard**: Built-in visitor tracking with GDPR compliance
+https://owncloud.gwdg.de/index.php/s/PyQ2nN6aKpypKfG?path=%2FApps%2FLayout%20App%2Fmodel%20weights
 
----
+Place these files in backend/models:
 
-## 🏗️ Architecture
+- best_emanuskript_segmentation.pt
+- best_catmus.pt
+- best_zone_detection.pt
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Gradio Web Interface                      │
-├─────────────┬─────────────────┬─────────────────────────────────┤
-│ Single Image│  Batch (ZIP)    │         Analytics Tab           │
-│    Tab      │     Tab         │                                 │
-├─────────────┴─────────────────┴─────────────────────────────────┤
-│              Parallel Processing Layer (spawn)                   │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │  emanuskript │  │    catmus    │  │     zone     │          │
-│  │    model     │  │    model     │  │    model     │          │
-│  └──────────────┘  └──────────────┘  └──────────────┘          │
-├─────────────────────────────────────────────────────────────────┤
-│              Combination & Filtering (ImageBatch)                │
-├─────────────────────────────────────────────────────────────────┤
-│                    COCO JSON Output                              │
-└─────────────────────────────────────────────────────────────────┘
-```
+## Supported classes
 
----
+The backend exposes 22 final COCO classes, including:
 
-## 🚀 Quick Start
+- Layout: Border, Table, Diagram, Column
+- Script: Main script black/coloured, Variant script black/coloured
+- Initials: Historiated, Inhabited, Zoo - Anthropomorphic, Embellished, Plain initial variants
+- Navigation/content: Page Number, Quire Mark, Running header, Catchword, Gloss, Illustrations
+- Music: Music
 
-### Prerequisites
+## API overview
 
-- Python 3.8+
-- CUDA (optional, for GPU acceleration)
+Base prefix: /api
 
-### Installation
+- GET /health
+- GET /classes
+- POST /predict/single
+- POST /predict/batch
+- GET /predict/batch/{task_id}/progress (SSE)
+- GET /predict/batch/{task_id}/results
+- GET /download/{task_id}/coco_json
+- GET /download/{task_id}/annotated_image
+- GET /download/{task_id}/annotated/{index}
+- GET /download/{task_id}/results_zip
+- GET /download/{task_id}/page_xml
+- POST /analytics/login
+- GET /analytics/data (JWT required)
+
+## Local development
+
+Prerequisites:
+
+- Python 3.11+
+- Node.js 20+
+- npm
+
+### 1) Clone
 
 ```bash
-# Clone the repository
-git clone https://github.com/emanuskript/layout.git
-cd layout
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the application
-python app.py
+git clone https://github.com/emanuskript/Mergen.git
+cd Mergen
 ```
 
-Access the web interface at: `http://localhost:8000`
+### 2) Prepare model files
 
----
+Create backend/models and copy the three .pt files listed above.
 
-## 📦 Models
+### 3) Run backend
 
-The application uses three YOLO models:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip setuptools wheel
+pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+pip install -e backend
 
-| Model | File | Purpose |
-|-------|------|---------|
-| **emanuskript** | `best_emanuskript_segmentation.pt` | Manuscript elements (scripts, initials, decorations) |
-| **catmus** | `best_catmus.pt` | Lines and zones (DefaultLine, InterlinearLine) |
-| **zone** | `best_zone_detection.pt` | Zone detection (MainZone, GraphicZone, etc.) |
-
----
-
-## 🏷️ Supported Classes (25)
-
-| Category | Classes |
-|----------|---------|
-| **Layout** | Border, Column, Table, Diagram |
-| **Script** | Main script black, Main script coloured, Variant script black, Variant script coloured |
-| **Initials** | Historiated, Inhabited, Zoo - Anthropomorphic, Embellished, Plain initial - coloured, Plain initial - Highlighted, Plain initial - Black |
-| **Navigation** | Page Number, Quire Mark, Running header, Catchword |
-| **Content** | Gloss, Illustrations |
-| **Zones** | GraphicZone, MusicLine, MusicZone, Music |
-
----
-
-## 💻 Usage
-
-### Single Image Processing
-
-1. Upload an image (JPEG/PNG/TIFF/BMP/WebP)
-2. Adjust confidence threshold (default: 0.25)
-3. Adjust IoU threshold (default: 0.3)
-4. Select/deselect classes to visualize
-5. Click **"Run 3 Models + Combine"**
-6. Download results via buttons
-
-### Batch Processing
-
-1. Create a ZIP file with images (nested folders supported)
-2. Upload the ZIP file
-3. Configure thresholds and classes
-4. Click **"Process ZIP"**
-5. Browse results in gallery
-6. Download merged annotations or complete ZIP
-
----
-
-## ⚙️ Configuration
-
-### Server Settings
-
-```python
-demo.launch(
-    server_name="0.0.0.0",    # Bind to all interfaces
-    server_port=8000,          # HTTP port
-    max_threads=4,             # Concurrent request limit
-)
+cd backend
+MODEL_DIR="$(pwd)/models" CORS_ORIGINS="http://localhost:3000" uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
 ```
 
-### Multiprocessing
+Backend URL: http://localhost:8000
+Docs: http://localhost:8000/docs
 
-The application uses Python's `multiprocessing` with `spawn` method for safe parallel execution:
+### 4) Run frontend
 
-- 3 worker processes (one per model)
-- Models are cached per-process after first load
-- Pre-initialized pool avoids threading issues with Gradio
+In a new terminal:
 
----
-
-## 📁 Project Structure
-
-```
-layout/
-├── app.py                              # Main Gradio application
-├── test_combined_models.py             # Model inference logic
-├── requirements.txt                    # Python dependencies
-├── analytics.db                        # SQLite visitor database (auto-created)
-├── best_emanuskript_segmentation.pt    # YOLO model weights
-├── best_catmus.pt                      # YOLO model weights
-├── best_zone_detection.pt              # YOLO model weights
-├── utils/
-│   └── image_batch_classes.py          # ImageBatch class & mappings
-├── monitoring/                         # Grafana/Loki monitoring configs
-└── APP_DOCUMENTATION.md                # Detailed documentation
+```bash
+cd frontend
+npm install
+BACKEND_URL=http://localhost:8000 npm run dev -- --hostname 0.0.0.0 --port 3000
 ```
 
----
+Frontend URL: http://localhost:3000/analyze
 
-## 📊 Output Format
+## Deployment
 
-Annotations are exported in **COCO format**:
+You can deploy with either Docker Compose (recommended) or direct host deployment script.
 
-```json
-{
-  "images": [...],
-  "annotations": [
-    {
-      "id": 1,
-      "image_id": 1,
-      "category_id": 4,
-      "segmentation": [[x1, y1, x2, y2, ...]],
-      "bbox": [x, y, width, height],
-      "area": 12345.0
-    }
-  ],
-  "categories": [
-    {"id": 4, "name": "Main script black"}
-  ]
-}
+### Option A: Docker Compose + Caddy
+
+1. Ensure backend/model files are present.
+2. Optionally set environment values:
+   - SITE_ADDRESS (for Caddy, default :80)
+   - JWT_SECRET
+   - ANALYTICS_USERNAME
+   - ANALYTICS_PASSWORD
+
+Run:
+
+```bash
+docker compose up -d --build
 ```
 
----
+This starts:
 
-## 🔒 Privacy & Compliance
+- backend service (FastAPI)
+- frontend service (Next.js standalone)
+- caddy (reverse proxy on ports 80/443)
 
-- **Anonymization**: IPs are hashed (SHA256, truncated)
-- **Cookie Banner**: GDPR-compliant consent mechanism
-- **Session Tracking**: Hash-based, no persistent identifiers
+### Option B: Direct host deployment (systemd + nginx)
 
----
+The repository includes deploy.sh, which installs dependencies, builds frontend, provisions systemd services, and configures nginx.
 
-## 📄 License
+Run from project root:
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+```bash
+chmod +x deploy.sh
+./deploy.sh
+```
 
----
+The script expects model weights in backend/models before deployment.
 
-## 🤝 Contributing
+## Important configuration
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Backend environment variables:
 
----
+- MODEL_DIR (defaults to backend/models)
+- CORS_ORIGINS (comma-separated, default http://localhost:3000)
+- MAX_POOL_WORKERS (default 3)
+- JWT_SECRET
+- ANALYTICS_USERNAME
+- ANALYTICS_PASSWORD
 
-## 📚 Documentation
+Frontend build/runtime:
 
-For detailed documentation, see [APP_DOCUMENTATION.md](APP_DOCUMENTATION.md).
+- BACKEND_URL (used by Next.js rewrite from /api/* to backend)
+
+## Analytics authentication
+
+Default credentials are configured in backend/app/config.py and should be changed in production:
+
+- username: admin
+- password: layout2024
+
+## Repository structure
+
+```text
+.
+├── backend/
+│   ├── app/
+│   ├── models/
+│   └── pyproject.toml
+├── frontend/
+├── docker-compose.yml
+├── Caddyfile
+└── deploy.sh
+```
+
+## License
+
+Licensed under Apache 2.0. See LICENSE.
