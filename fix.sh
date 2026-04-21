@@ -5,16 +5,31 @@ APP_NAME="${APP_NAME:-layout}"
 BACKEND_SERVICE="${BACKEND_SERVICE:-layout-backend}"
 FRONTEND_SERVICE="${FRONTEND_SERVICE:-layout-frontend}"
 NGINX_SERVICE="${NGINX_SERVICE:-nginx}"
+
 BACKEND_URL="${BACKEND_URL:-http://127.0.0.1:8000}"
 NGINX_LOCAL_URL="${NGINX_LOCAL_URL:-http://127.0.0.1}"
-UPLOAD_ENDPOINT="${UPLOAD_ENDPOINT:-/api/predict/single}"
+
 HEALTH_ENDPOINT="${HEALTH_ENDPOINT:-/api/health}"
 CLASSES_ENDPOINT="${CLASSES_ENDPOINT:-/api/classes}"
+UPLOAD_ENDPOINT="${UPLOAD_ENDPOINT:-/api/predict/single}"
 
-log()  { echo -e "\033[1;34m==>\033[0m $*"; }
-ok()   { echo -e "\033[1;32mOK \033[0m $*"; }
-warn() { echo -e "\033[1;33m!! \033[0m $*"; }
-err()  { echo -e "\033[1;31mXX \033[0m $*" >&2; }
+UPLOAD_LIMIT="${UPLOAD_LIMIT:-50M}"
+PROXY_CONNECT_TIMEOUT="${PROXY_CONNECT_TIMEOUT:-60s}"
+PROXY_READ_TIMEOUT="${PROXY_READ_TIMEOUT:-600s}"
+PROXY_SEND_TIMEOUT="${PROXY_SEND_TIMEOUT:-600s}"
+
+WORKDIR="${WORKDIR:-$PWD}"
+
+BLUE='\033[1;34m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+RED='\033[1;31m'
+RESET='\033[0m'
+
+log()  { echo -e "${BLUE}==>${RESET} $*"; }
+ok()   { echo -e "${GREEN}OK${RESET}  $*"; }
+warn() { echo -e "${YELLOW}!!${RESET}  $*"; }
+err()  { echo -e "${RED}XX${RESET}  $*" >&2; }
 
 if [[ "${EUID}" -eq 0 ]]; then
   SUDO=""
@@ -29,18 +44,29 @@ need_cmd() {
   }
 }
 
+cleanup() {
+  [[ -n "${TMP_SRC:-}" && -f "${TMP_SRC:-}" ]] && rm -f "$TMP_SRC" || true
+  [[ -n "${TMP_OUT:-}" && -f "${TMP_OUT:-}" ]] && rm -f "$TMP_OUT" || true
+  [[ -n "${TEST_IMG:-}" && -f "${TEST_IMG:-}" ]] && rm -f "$TEST_IMG" || true
+  [[ -n "${BODY1:-}" && -f "${BODY1:-}" ]] && rm -f "$BODY1" || true
+  [[ -n "${BODY2:-}" && -f "${BODY2:-}" ]] && rm -f "$BODY2" || true
+  [[ -n "${BODY3:-}" && -f "${BODY3:-}" ]] && rm -f "$BODY3" || true
+}
+trap cleanup EXIT
+
 need_cmd curl
 need_cmd python3
 need_cmd nginx
 need_cmd systemctl
 need_cmd journalctl
+need_cmd mktemp
 need_cmd grep
 need_cmd sed
 need_cmd awk
-need_cmd mktemp
 
 find_nginx_file() {
-  local candidate=""
+  local f
+
   for f in \
     /etc/nginx/sites-available/layout-host \
     /etc/nginx/sites-enabled/layout-host \
@@ -49,81 +75,123 @@ find_nginx_file() {
     /etc/nginx/sites-available/default
   do
     if [[ -f "$f" ]]; then
-      candidate="$f"
-      break
+      echo "$f"
+      return 0
     fi
   done
 
-  if [[ -z "$candidate" ]]; then
-    candidate="$($SUDO grep -RIl '127\.0\.0\.1:8000\|layout-backend\|/api/' /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null | head -n1 || true)"
+  f="$($SUDO grep -RIl '127\.0\.0\.1:8000\|layout-backend\|/api/' \
+      /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null | head -n1 || true)"
+
+  if [[ -n "$f" ]]; then
+    echo "$f"
+    return 0
   fi
 
-  echo "$candidate"
+  return 1
+}
+
+backup_nginx_file() {
+  local file="$1"
+  BACKUP_FILE="${file}.bak.$(date +%Y%m%d_%H%M%S)"
+  $SUDO cp "$file" "$BACKUP_FILE"
+  ok "Backed up nginx config to $BACKUP_FILE"
+}
+
+restore_nginx_backup() {
+  local file="$1"
+  if [[ -n "${BACKUP_FILE:-}" && -f "${BACKUP_FILE:-}" ]]; then
+    warn "Restoring nginx config from backup"
+    $SUDO cp "$BACKUP_FILE" "$file"
+    $SUDO nginx -t >/dev/null 2>&1 || true
+    $SUDO systemctl reload "$NGINX_SERVICE" >/dev/null 2>&1 || true
+  fi
 }
 
 patch_nginx_file() {
   local file="$1"
 
-  [[ -f "$file" ]] || {
-    err "Nginx config file not found: $file"
-    return 1
-  }
+  TMP_SRC="$(mktemp "$WORKDIR/.fix_src.XXXXXX")"
+  TMP_OUT="$(mktemp "$WORKDIR/.fix_out.XXXXXX")"
 
-  local backup="${file}.bak.$(date +%Y%m%d_%H%M%S)"
-  $SUDO cp "$file" "$backup"
-  ok "Backed up nginx config to $backup"
+  $SUDO cat "$file" > "$TMP_SRC"
 
-  local tmp
-  tmp="$(mktemp)"
-
-  $SUDO python3 - "$file" "$tmp" <<'PY'
+  python3 - "$TMP_SRC" "$TMP_OUT" \
+    "$UPLOAD_LIMIT" \
+    "$PROXY_CONNECT_TIMEOUT" \
+    "$PROXY_READ_TIMEOUT" \
+    "$PROXY_SEND_TIMEOUT" <<'PY'
 import re
 import sys
 from pathlib import Path
 
 src = Path(sys.argv[1])
-tmp = Path(sys.argv[2])
+out = Path(sys.argv[2])
+
+upload_limit = sys.argv[3]
+proxy_connect_timeout = sys.argv[4]
+proxy_read_timeout = sys.argv[5]
+proxy_send_timeout = sys.argv[6]
 
 text = src.read_text()
 
-directives = {
-    "client_max_body_size": "50M",
-    "proxy_connect_timeout": "60s",
-    "proxy_read_timeout": "600s",
-    "proxy_send_timeout": "600s",
+server_match = re.search(r'\bserver\s*\{', text)
+if not server_match:
+    raise SystemExit("No nginx server block found.")
+
+start = server_match.start()
+open_brace = server_match.end() - 1
+
+depth = 0
+end = None
+for i in range(open_brace, len(text)):
+    ch = text[i]
+    if ch == '{':
+        depth += 1
+    elif ch == '}':
+        depth -= 1
+        if depth == 0:
+            end = i
+            break
+
+if end is None:
+    raise SystemExit("Could not find end of nginx server block.")
+
+server_block = text[start:end+1]
+
+replacements = {
+    "client_max_body_size": upload_limit,
+    "proxy_connect_timeout": proxy_connect_timeout,
+    "proxy_read_timeout": proxy_read_timeout,
+    "proxy_send_timeout": proxy_send_timeout,
     "proxy_request_buffering": "off",
     "proxy_buffering": "off",
 }
 
-for key, value in directives.items():
-    text = re.sub(
-        rf"(^\s*{re.escape(key)}\s+)[^;]+;",
-        rf"\1{value};",
-        text,
-        flags=re.MULTILINE,
-    )
+for key, value in replacements.items():
+    pattern = re.compile(rf'(^[ \t]*{re.escape(key)}[ \t]+)[^;]+;', re.MULTILINE)
+    if pattern.search(server_block):
+        server_block = pattern.sub(lambda m, v=value: f"{m.group(1)}{v};", server_block)
+    else:
+        insertion = f"    {key} {value};\n"
+        brace_pos = server_block.find("{")
+        server_block = server_block[:brace_pos+1] + "\n" + insertion + server_block[brace_pos+1:]
 
-missing = [k for k in directives if not re.search(rf"^\s*{re.escape(k)}\s+[^;]+;", text, flags=re.MULTILINE)]
-
-block = "\n".join([
-    f"    {k} {v};" for k, v in directives.items() if k in missing
-])
-
-if block:
-    m = re.search(r"server\s*\{", text)
-    if not m:
-        raise SystemExit("No nginx server block found to patch.")
-    insert_at = m.end()
-    text = text[:insert_at] + "\n" + block + text[insert_at:]
-
-tmp.write_text(text)
+new_text = text[:start] + server_block + text[end+1:]
+out.write_text(new_text)
 PY
 
-  $SUDO cp "$tmp" "$file"
-  rm -f "$tmp"
+  backup_nginx_file "$file"
+  $SUDO cp "$TMP_OUT" "$file"
 
-  $SUDO nginx -t >/dev/null
-  ok "Nginx config syntax is valid"
+  if ! $SUDO nginx -t >/dev/null 2>&1; then
+    err "nginx syntax test failed after patch"
+    restore_nginx_backup "$file"
+    err "Broken patch reverted"
+    exit 1
+  fi
+
+  ok "nginx config patched successfully"
 }
 
 restart_services() {
@@ -134,20 +202,20 @@ restart_services() {
   $SUDO systemctl restart "$NGINX_SERVICE"
 }
 
-wait_for_health() {
+wait_for_url() {
   local url="$1"
   local tries="${2:-30}"
   local i
 
   for ((i=1; i<=tries; i++)); do
     if curl -fsS "$url" >/dev/null 2>&1; then
-      ok "Health check passed: $url"
+      ok "Reachable: $url"
       return 0
     fi
     sleep 2
   done
 
-  err "Health check failed: $url"
+  err "Not reachable after waiting: $url"
   return 1
 }
 
@@ -178,104 +246,105 @@ with open(path, "wb") as f:
 PY
 }
 
-curl_status() {
+post_file() {
   local url="$1"
-  local outfile="$2"
-  shift 2
-  curl -sS -o "$outfile" -w "%{http_code}" "$url" "$@" || true
+  local body="$2"
+  local img="$3"
+
+  curl -sS \
+    -o "$body" \
+    -w "%{http_code}" \
+    -X POST \
+    -F "image=@${img};type=image/png" \
+    "$url" || true
 }
 
-show_recent_logs() {
+print_body_preview() {
+  local label="$1"
+  local code="$2"
+  local body="$3"
+
+  echo "$label HTTP $code"
+  head -c 600 "$body" || true
+  echo
+  echo
+}
+
+show_logs() {
   warn "Recent backend logs:"
-  $SUDO journalctl -u "$BACKEND_SERVICE" -n 80 --no-pager || true
+  $SUDO journalctl -u "$BACKEND_SERVICE" -n 120 --no-pager || true
+  echo
   warn "Recent nginx error log:"
-  $SUDO tail -n 80 /var/log/nginx/error.log 2>/dev/null || true
+  $SUDO tail -n 120 /var/log/nginx/error.log 2>/dev/null || true
+  echo
+}
+
+show_service_status() {
+  warn "Service status:"
+  $SUDO systemctl --no-pager --full status "$BACKEND_SERVICE" "$FRONTEND_SERVICE" "$NGINX_SERVICE" || true
+  echo
 }
 
 main() {
   log "Finding active nginx config"
-  local nginx_file
-  nginx_file="$(find_nginx_file)"
+  NGINX_FILE="$(find_nginx_file || true)"
 
-  if [[ -z "$nginx_file" ]]; then
-    err "Could not detect the active nginx site config automatically."
+  if [[ -z "${NGINX_FILE:-}" ]]; then
+    err "Could not detect the active nginx config."
     exit 1
   fi
 
-  ok "Using nginx config: $nginx_file"
+  ok "Using nginx config: $NGINX_FILE"
 
-  log "Patching nginx for uploads and longer proxy timeouts"
-  patch_nginx_file "$nginx_file"
+  log "Patching nginx for uploads and proxy timeouts"
+  patch_nginx_file "$NGINX_FILE"
 
   restart_services
 
-  wait_for_health "${BACKEND_URL}${HEALTH_ENDPOINT}" 30
-  wait_for_health "${NGINX_LOCAL_URL}${HEALTH_ENDPOINT}" 30
+  wait_for_url "${BACKEND_URL}${HEALTH_ENDPOINT}" 30
+  wait_for_url "${NGINX_LOCAL_URL}${HEALTH_ENDPOINT}" 30
+
+  TEST_IMG="$(mktemp "$WORKDIR/.upload_test.XXXXXX.png")"
+  make_test_png "$TEST_IMG"
+  ok "Created test image: $TEST_IMG"
+
+  BODY1="$(mktemp "$WORKDIR/.body1.XXXXXX")"
+  BODY2="$(mktemp "$WORKDIR/.body2.XXXXXX")"
+  BODY3="$(mktemp "$WORKDIR/.body3.XXXXXX")"
 
   log "Checking classes endpoint through nginx"
-  local classes_body
-  classes_body="$(mktemp)"
-  local classes_code
-  classes_code="$(curl_status "${NGINX_LOCAL_URL}${CLASSES_ENDPOINT}" "$classes_body")"
-  echo "classes HTTP $classes_code"
-  head -c 300 "$classes_body" || true
-  echo
-  rm -f "$classes_body"
+  CLASSES_CODE="$(curl -sS -o "$BODY1" -w "%{http_code}" "${NGINX_LOCAL_URL}${CLASSES_ENDPOINT}" || true)"
+  print_body_preview "classes" "$CLASSES_CODE" "$BODY1"
 
-  local test_img
-  test_img="$(mktemp --suffix=.png)"
-  make_test_png "$test_img"
-  ok "Created test image: $test_img"
+  log "Testing direct backend upload"
+  DIRECT_CODE="$(post_file "${BACKEND_URL}${UPLOAD_ENDPOINT}" "$BODY2" "$TEST_IMG")"
+  print_body_preview "direct backend upload" "$DIRECT_CODE" "$BODY2"
 
-  log "Testing upload directly against backend"
-  local backend_body backend_code
-  backend_body="$(mktemp)"
-  backend_code="$(
-    curl_status "${BACKEND_URL}${UPLOAD_ENDPOINT}" "$backend_body" \
-      -X POST \
-      -F "image=@${test_img};type=image/png"
-  )"
-  echo "backend upload HTTP $backend_code"
-  head -c 500 "$backend_body" || true
-  echo
+  log "Testing nginx upload"
+  NGINX_CODE="$(post_file "${NGINX_LOCAL_URL}${UPLOAD_ENDPOINT}" "$BODY3" "$TEST_IMG")"
+  print_body_preview "nginx upload" "$NGINX_CODE" "$BODY3"
 
-  log "Testing upload through nginx"
-  local nginx_body nginx_code
-  nginx_body="$(mktemp)"
-  nginx_code="$(
-    curl_status "${NGINX_LOCAL_URL}${UPLOAD_ENDPOINT}" "$nginx_body" \
-      -X POST \
-      -F "image=@${test_img};type=image/png"
-  )"
-  echo "nginx upload HTTP $nginx_code"
-  head -c 500 "$nginx_body" || true
-  echo
-
-  rm -f "$test_img"
-
-  if [[ "$backend_code" == "200" && "$nginx_code" == "200" ]]; then
+  if [[ "$DIRECT_CODE" == "200" && "$NGINX_CODE" == "200" ]]; then
     ok "Upload works directly and through nginx."
-    rm -f "$backend_body" "$nginx_body"
     exit 0
   fi
 
-  if [[ "$backend_code" == "200" && "$nginx_code" != "200" ]]; then
+  if [[ "$DIRECT_CODE" == "200" && "$NGINX_CODE" != "200" ]]; then
     err "Backend upload works, but nginx upload still fails."
-    show_recent_logs
-    rm -f "$backend_body" "$nginx_body"
+    show_logs
     exit 2
   fi
 
-  if [[ "$backend_code" != "200" ]]; then
-    err "Direct backend upload failed. This is not only an nginx issue."
-    show_recent_logs
-    rm -f "$backend_body" "$nginx_body"
+  if [[ "$DIRECT_CODE" != "200" ]]; then
+    err "Direct backend upload failed too. This is not only nginx."
+    show_logs
+    show_service_status
     exit 3
   fi
 
-  err "Unexpected state."
-  show_recent_logs
-  rm -f "$backend_body" "$nginx_body"
+  err "Unexpected upload state."
+  show_logs
+  show_service_status
   exit 4
 }
 
