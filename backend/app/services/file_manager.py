@@ -6,11 +6,11 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from threading import Lock
-from typing import Any, Dict
+from typing import Dict
 
 from app.config import settings
 
-TASK_BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ".tasks")
+TASK_BASE_DIR = settings.task_base_dir
 
 
 @dataclass
@@ -38,10 +38,15 @@ _task_store: Dict[str, TaskState] = {}
 _lock = Lock()
 
 
+def _ensure_task_base_dir() -> str:
+    os.makedirs(TASK_BASE_DIR, exist_ok=True)
+    return TASK_BASE_DIR
+
+
 def create_task() -> TaskState:
     """Create a new task with a unique ID and working directory."""
     task_id = uuid.uuid4().hex[:12]
-    task_dir = os.path.join(TASK_BASE_DIR, task_id)
+    task_dir = os.path.join(_ensure_task_base_dir(), task_id)
     os.makedirs(task_dir, exist_ok=True)
 
     task = TaskState(task_id=task_id)
@@ -56,7 +61,7 @@ def get_task(task_id: str) -> TaskState | None:
 
 
 def get_task_dir(task_id: str) -> str:
-    path = os.path.join(TASK_BASE_DIR, task_id)
+    path = os.path.join(_ensure_task_base_dir(), task_id)
     os.makedirs(path, exist_ok=True)
     return path
 
