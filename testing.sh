@@ -1,372 +1,398 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# ============================================================
-# Layout app reachability + nginx proxy setup + endpoint checks
-# Overwrites nginx site config so the app is reachable on:
-#   http://<vm-hostname-or-ip>/
-#
-# Run with:
-#   sudo bash ./testing.sh
-# ============================================================
+############################################
+# Config
+############################################
+FRONTEND_HOST="${FRONTEND_HOST:-127.0.0.1}"
+FRONTEND_PORT="${FRONTEND_PORT:-3000}"
+BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
+BACKEND_PORT="${BACKEND_PORT:-8000}"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+SITE_NAME="${SITE_NAME:-layout-host}"
+NGINX_CONF="/etc/nginx/sites-available/${SITE_NAME}"
+NGINX_LINK="/etc/nginx/sites-enabled/${SITE_NAME}"
 
-ok()   { echo -e "${GREEN}OK${NC}  $*"; }
-warn() { echo -e "${YELLOW}!!${NC}  $*"; }
-err()  { echo -e "${RED}XX${NC}  $*"; }
-info() { echo -e "${BLUE}==>${NC} $*"; }
+# Optional:
+# If you have a real DNS hostname pointing to this VM, set:
+#   DOMAIN=your-hostname.example.org
+#   CERTBOT_EMAIL=you@example.org
+DOMAIN="${DOMAIN:-}"
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
 
-REAL_USER="${SUDO_USER:-$USER}"
-REAL_HOME="$(getent passwd "$REAL_USER" | cut -d: -f6)"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Optional smoke test image:
+#   TEST_IMAGE=/absolute/path/to/test.jpg
+TEST_IMAGE="${TEST_IMAGE:-}"
 
-if [[ -d "$SCRIPT_DIR/backend" && -d "$SCRIPT_DIR/frontend" ]]; then
-  ROOT_DIR="$SCRIPT_DIR"
+############################################
+# Helpers
+############################################
+log()  { echo -e "\033[1;34m==>\033[0m $*"; }
+ok()   { echo -e "\033[1;32mOK\033[0m  $*"; }
+warn() { echo -e "\033[1;33m!!\033[0m  $*"; }
+err()  { echo -e "\033[1;31mXX\033[0m  $*" >&2; }
+
+if [[ "${EUID}" -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  else
+    err "Run as root or install sudo."
+    exit 1
+  fi
 else
-  ROOT_DIR="${ROOT_DIR:-$REAL_HOME/layout}"
+  SUDO=""
 fi
 
-BACKEND_DIR="$ROOT_DIR/backend"
-FRONTEND_DIR="$ROOT_DIR/frontend"
-MODELS_DIR="$BACKEND_DIR/models"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PUBLIC_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+FQDN="$(hostname -f 2>/dev/null || true)"
 
-FRONTEND_LOCAL="http://127.0.0.1:3000"
-BACKEND_LOCAL="http://127.0.0.1:8000"
-NGINX_LOCAL="http://127.0.0.1"
+BEST_HTTP_LINK=""
+if [[ -n "${DOMAIN}" ]]; then
+  BEST_HTTP_LINK="http://${DOMAIN}/"
+elif [[ -n "${FQDN}" && "${FQDN}" != "localhost" && "${FQDN}" != "(none)" ]]; then
+  BEST_HTTP_LINK="http://${FQDN}/"
+elif [[ -n "${PUBLIC_IP}" ]]; then
+  BEST_HTTP_LINK="http://${PUBLIC_IP}/"
+else
+  BEST_HTTP_LINK="http://127.0.0.1/"
+fi
 
-NGINX_SITE_AVAIL="/etc/nginx/sites-available/layout-host"
-NGINX_SITE_ENABLED="/etc/nginx/sites-enabled/layout-host"
-OPENAPI_TMP="/tmp/layout_openapi_$$.json"
-
-cleanup() {
-  rm -f "$OPENAPI_TMP"
-}
-trap cleanup EXIT
-
-http_code() {
+curl_code() {
   local url="$1"
-  curl -L -sS -o /dev/null -w "%{http_code}" --max-time 15 "$url" 2>/dev/null || echo "000"
+  curl -sS -o /dev/null -w "%{http_code}" --max-time 20 "$url" || true
 }
 
-is_good_code() {
-  local code="$1"
-  [[ "$code" != "000" && "$code" != "404" && "$code" != "502" && "$code" != "503" && "$code" != "504" ]]
-}
-
-wait_for_url() {
-  local name="$1"
-  local url="$2"
-  local tries="${3:-20}"
-  local sleep_sec="${4:-2}"
-  local code="000"
-
-  for ((i=1; i<=tries; i++)); do
-    code="$(http_code "$url")"
-    if is_good_code "$code"; then
-      ok "$name is reachable: $url (HTTP $code)"
-      return 0
-    fi
-    sleep "$sleep_sec"
-  done
-
-  err "$name did not become reachable: $url (last HTTP $code)"
-  return 1
-}
-
-reload_nginx() {
-  info "Reloading nginx"
-
-  if systemctl list-unit-files 2>/dev/null | grep -q '^nginx\.service'; then
-    systemctl enable nginx >/dev/null 2>&1 || true
-    systemctl restart nginx
+check_url() {
+  local url="$1"
+  local code
+  code="$(curl_code "$url")"
+  if [[ "$code" =~ ^2|3 ]]; then
+    ok "$url -> HTTP $code"
     return 0
+  else
+    err "$url -> HTTP $code"
+    return 1
   fi
-
-  if service nginx status >/dev/null 2>&1 || service nginx restart >/dev/null 2>&1; then
-    service nginx restart >/dev/null 2>&1 || true
-    return 0
-  fi
-
-  if pgrep -x nginx >/dev/null 2>&1; then
-    nginx -s reload
-    return 0
-  fi
-
-  nginx
 }
 
-first_public_ip() {
-  ip -4 route get 1.1.1.1 2>/dev/null | awk '{
-    for (i=1; i<=NF; i++) if ($i=="src") { print $(i+1); exit }
-  }'
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 1; }
 }
 
-best_public_host() {
-  local fqdn=""
-  local pubip=""
+############################################
+# Preflight
+############################################
+require_cmd curl
+require_cmd python3
+require_cmd nginx
 
-  fqdn="$(hostname -f 2>/dev/null || true)"
-  pubip="$(first_public_ip || true)"
+log "Checking local upstreams first"
 
-  if [[ -n "$fqdn" && "$fqdn" == *.* && "$fqdn" != "localhost" ]]; then
-    echo "$fqdn"
-    return 0
-  fi
-
-  if [[ -n "$pubip" ]]; then
-    echo "$pubip"
-    return 0
-  fi
-
-  return 1
+check_url "http://${FRONTEND_HOST}:${FRONTEND_PORT}/" || {
+  err "Frontend is not reachable on ${FRONTEND_HOST}:${FRONTEND_PORT}"
+  exit 1
 }
 
-print_model_status() {
-  info "Checking model weights"
-
-  local missing=0
-  local models=(
-    "$MODELS_DIR/best_catmus.pt"
-    "$MODELS_DIR/best_emanuskript_segmentation.pt"
-    "$MODELS_DIR/best_zone_detection.pt"
-  )
-
-  for m in "${models[@]}"; do
-    if [[ -s "$m" ]]; then
-      ok "Found model: $m ($(du -h "$m" | awk '{print $1}'))"
-    else
-      err "Missing or empty model: $m"
-      missing=1
-    fi
-  done
-
-  return "$missing"
+check_url "http://${BACKEND_HOST}:${BACKEND_PORT}/openapi.json" || {
+  err "Backend openapi is not reachable on ${BACKEND_HOST}:${BACKEND_PORT}"
+  exit 1
 }
 
-write_nginx_config() {
-  info "Writing clean nginx config"
+check_url "http://${BACKEND_HOST}:${BACKEND_PORT}/api/health" || {
+  err "Backend /api/health is not reachable on ${BACKEND_HOST}:${BACKEND_PORT}"
+  exit 1
+}
 
-  mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+############################################
+# Write nginx config
+############################################
+log "Writing clean nginx config"
 
-  if [[ -f "$NGINX_SITE_AVAIL" ]]; then
-    cp "$NGINX_SITE_AVAIL" "${NGINX_SITE_AVAIL}.bak.$(date +%Y%m%d_%H%M%S)"
-    ok "Backed up existing nginx config"
-  fi
+SERVER_NAME="_"
+if [[ -n "${DOMAIN}" ]]; then
+  SERVER_NAME="${DOMAIN}"
+fi
 
-  cat > "$NGINX_SITE_AVAIL" <<'EOF'
+BACKUP_SUFFIX="$(date +%Y%m%d_%H%M%S)"
+if [[ -f "${NGINX_CONF}" ]]; then
+  ${SUDO} cp "${NGINX_CONF}" "${NGINX_CONF}.bak.${BACKUP_SUFFIX}"
+  ok "Backed up nginx config to ${NGINX_CONF}.bak.${BACKUP_SUFFIX}"
+fi
+
+${SUDO} tee "${NGINX_CONF}" >/dev/null <<EOF
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
-    server_name _;
+    server_name ${SERVER_NAME};
 
-    client_max_body_size 1024M;
-    proxy_connect_timeout 600s;
-    proxy_send_timeout 600s;
-    proxy_read_timeout 600s;
-    send_timeout 600s;
+    client_max_body_size 512M;
+    client_body_timeout 3600s;
+    proxy_connect_timeout 60s;
+    proxy_send_timeout 3600s;
+    proxy_read_timeout 3600s;
+    send_timeout 3600s;
+
+    # Backend docs / schema
+    location = /openapi.json {
+        proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT}/openapi.json;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /docs {
+        proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT}/docs;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /redoc {
+        proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT}/redoc;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    # API
+    location /api/ {
+        proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT};
+        proxy_http_version 1.1;
+
+        # Important for large single/batch uploads
+        proxy_request_buffering off;
+        proxy_buffering off;
+        proxy_max_temp_file_size 0;
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
 
     # Frontend
     location / {
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://${FRONTEND_HOST}:${FRONTEND_PORT};
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header Upgrade $http_upgrade;
+
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    # Backend API routes (preserve /api prefix)
-    location /api/ {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header Connection "";
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    # FastAPI docs / schema
-    location = /openapi.json {
-        proxy_pass http://127.0.0.1:8000/openapi.json;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header Connection "";
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    location /docs {
-        proxy_pass http://127.0.0.1:8000/docs;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header Connection "";
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-    }
-
-    location /redoc {
-        proxy_pass http://127.0.0.1:8000/redoc;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header Connection "";
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
     }
 }
 EOF
 
-  rm -f "$NGINX_SITE_ENABLED"
-  ln -sf "$NGINX_SITE_AVAIL" "$NGINX_SITE_ENABLED"
-  rm -f /etc/nginx/sites-enabled/default || true
+log "Relinking sites-enabled"
+${SUDO} mkdir -p /etc/nginx/sites-enabled /etc/nginx/sites-available
+${SUDO} rm -f /etc/nginx/sites-enabled/default || true
+${SUDO} ln -sf "${NGINX_CONF}" "${NGINX_LINK}"
 
-  nginx -t
-  ok "nginx syntax is valid"
+log "Testing nginx syntax"
+${SUDO} nginx -t
+ok "nginx syntax is valid"
 
-  reload_nginx
-  ok "nginx reloaded"
-}
+log "Reloading nginx"
+if pgrep -x nginx >/dev/null 2>&1; then
+  ${SUDO} nginx -s reload
+else
+  ${SUDO} nginx
+fi
+ok "nginx is running"
 
-fetch_openapi() {
-  info "Fetching backend OpenAPI spec"
-  curl -fsS "$BACKEND_LOCAL/openapi.json" -o "$OPENAPI_TMP"
-  ok "Downloaded OpenAPI spec from $BACKEND_LOCAL/openapi.json"
-}
+############################################
+# Optional firewall opening
+############################################
+if command -v ufw >/dev/null 2>&1; then
+  if ufw status 2>/dev/null | grep -qi "Status: active"; then
+    log "UFW is active, allowing 80/tcp and 443/tcp"
+    ${SUDO} ufw allow 80/tcp >/dev/null || true
+    ${SUDO} ufw allow 443/tcp >/dev/null || true
+    ok "Firewall rules checked"
+  fi
+fi
 
-print_openapi_paths() {
-  info "Discovered backend endpoints from OpenAPI"
-  python3 - "$OPENAPI_TMP" <<'PY'
-import json, sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    spec = json.load(f)
+############################################
+# Probe routes through nginx
+############################################
+log "Checking core URLs"
+
+check_url "http://127.0.0.1/"
+check_url "http://127.0.0.1/openapi.json"
+check_url "http://127.0.0.1/docs"
+check_url "http://127.0.0.1/api/health"
+
+############################################
+# Check route presence in OpenAPI
+############################################
+log "Checking route presence in OpenAPI"
+
+python3 - <<'PY'
+import json, sys, urllib.request
+
+url = "http://127.0.0.1/openapi.json"
+with urllib.request.urlopen(url, timeout=20) as r:
+    spec = json.load(r)
 
 paths = spec.get("paths", {})
-for path in sorted(paths):
-    print(path)
+needed = [
+    "/api/health",
+    "/api/classes",
+    "/api/predict/single",
+    "/api/predict/batch",
+]
+
+missing = [p for p in needed if p not in paths]
+if missing:
+    print("XX Missing routes in OpenAPI:")
+    for m in missing:
+        print("   ", m)
+    sys.exit(1)
+
+print("OK OpenAPI contains required routes:")
+for p in needed:
+    methods = ", ".join(sorted(paths[p].keys()))
+    print(f"   {p} [{methods}]")
 PY
-}
 
-probe_openapi_routes() {
-  info "Probing backend routes locally and through nginx"
+############################################
+# Route status checks via local backend and nginx
+############################################
+log "Probing backend routes locally and through nginx"
 
-  python3 - "$OPENAPI_TMP" <<'PY' | while IFS=$'\t' read -r path methods route_kind; do
-import json, sys
-with open(sys.argv[1], "r", encoding="utf-8") as f:
-    spec = json.load(f)
+python3 - <<'PY'
+import json
+import urllib.request
+import urllib.error
 
-valid_methods = {"get", "post", "put", "delete", "patch", "options", "head"}
-for path, meta in sorted(spec.get("paths", {}).items()):
-    methods = [m.upper() for m in meta.keys() if m.lower() in valid_methods]
-    kind = "dynamic" if "{" in path or "}" in path else "static"
-    print(f"{path}\t{','.join(sorted(methods))}\t{kind}")
+spec_url = "http://127.0.0.1/openapi.json"
+with urllib.request.urlopen(spec_url, timeout=20) as r:
+    spec = json.load(r)
+
+paths = spec.get("paths", {})
+targets = [
+    "/api/analytics/data",
+    "/api/analytics/login",
+    "/api/classes",
+    "/api/health",
+    "/api/predict/batch",
+    "/api/predict/single",
+]
+
+def probe(base, path, method):
+    url = base + path
+    req = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.getcode()
+    except urllib.error.HTTPError as e:
+        return e.code
+    except Exception:
+        return "ERR"
+
+for path in targets:
+    entry = paths.get(path)
+    if not entry:
+        print(f"SKIP missing path: {path}")
+        continue
+    methods = sorted(entry.keys())
+    method = "GET" if "get" in methods else ("POST" if "post" in methods else methods[0].upper())
+    local = probe("http://127.0.0.1:8000", path, method)
+    nginx = probe("http://127.0.0.1", path, method)
+    print(f"LOCAL  {path:26s} [{method}] -> {local}")
+    print(f"NGINX  {path:26s} [{method}] -> {nginx}")
 PY
-    if [[ "$route_kind" == "dynamic" ]]; then
-      echo "SKIP dynamic route: $path [$methods]"
-      continue
-    fi
 
-    local_code="$(http_code "$BACKEND_LOCAL$path")"
-    nginx_code="$(http_code "$NGINX_LOCAL$path")"
-
-    if is_good_code "$local_code"; then
-      echo "LOCAL  $path [$methods] -> $local_code"
-    else
-      echo "LOCAL  $path [$methods] -> $local_code  (problem)"
-    fi
-
-    if is_good_code "$nginx_code"; then
-      echo "NGINX  $path [$methods] -> $nginx_code"
-    else
-      echo "NGINX  $path [$methods] -> $nginx_code  (problem)"
-    fi
-  done
-}
-
-probe_manual_urls() {
-  info "Checking core URLs"
-
-  local manual_urls=(
-    "$FRONTEND_LOCAL/"
-    "$BACKEND_LOCAL/openapi.json"
-    "$BACKEND_LOCAL/api/health"
-    "$NGINX_LOCAL/"
-    "$NGINX_LOCAL/openapi.json"
-    "$NGINX_LOCAL/docs"
-    "$NGINX_LOCAL/api/health"
-  )
-
-  for u in "${manual_urls[@]}"; do
-    c="$(http_code "$u")"
-    if is_good_code "$c"; then
-      ok "$u -> HTTP $c"
-    else
-      err "$u -> HTTP $c"
-    fi
-  done
-}
-
-main() {
-  info "Root dir: $ROOT_DIR"
-
-  [[ -d "$ROOT_DIR" ]]     || { err "Root dir not found: $ROOT_DIR"; exit 1; }
-  [[ -d "$BACKEND_DIR" ]]  || { err "Backend dir not found: $BACKEND_DIR"; exit 1; }
-  [[ -d "$FRONTEND_DIR" ]] || { err "Frontend dir not found: $FRONTEND_DIR"; exit 1; }
-
-  command -v curl   >/dev/null 2>&1 || { err "curl is required"; exit 1; }
-  command -v nginx  >/dev/null 2>&1 || { err "nginx is required"; exit 1; }
-  command -v python3 >/dev/null 2>&1 || { err "python3 is required"; exit 1; }
-
-  print_model_status || true
-
-  info "Waiting for local services"
-  wait_for_url "frontend local" "$FRONTEND_LOCAL/" 20 2
-  wait_for_url "backend openapi local" "$BACKEND_LOCAL/openapi.json" 20 2
-  wait_for_url "backend health local" "$BACKEND_LOCAL/api/health" 20 2
-
-  write_nginx_config
-
-  wait_for_url "frontend through nginx" "$NGINX_LOCAL/" 20 2
-  wait_for_url "backend openapi through nginx" "$NGINX_LOCAL/openapi.json" 20 2
-  wait_for_url "backend health through nginx" "$NGINX_LOCAL/api/health" 20 2
-
-  fetch_openapi
-  print_openapi_paths
-  probe_openapi_routes
-  probe_manual_urls
-
-  PUBLIC_HOST="$(best_public_host || true)"
-  PUBLIC_URL=""
-  if [[ -n "$PUBLIC_HOST" ]]; then
-    PUBLIC_URL="http://$PUBLIC_HOST/"
-  fi
-
-  echo
-  ok "testing completed"
-  echo "Frontend local:      $FRONTEND_LOCAL/"
-  echo "Backend local:       $BACKEND_LOCAL/"
-  echo "Nginx local:         $NGINX_LOCAL/"
-  if [[ -n "$PUBLIC_URL" ]]; then
-    echo "Best final link:     $PUBLIC_URL"
-    c="$(http_code "$PUBLIC_URL")"
-    if is_good_code "$c"; then
-      ok "Public URL responds locally: $PUBLIC_URL (HTTP $c)"
-    else
-      warn "Public URL candidate does not respond from this VM: $PUBLIC_URL (HTTP $c)"
-      warn "If localhost works but this does not open from your laptop, the remaining issue is external networking/firewall/DNS, not the app itself."
-    fi
+############################################
+# Optional real smoke test for single endpoint
+############################################
+if [[ -n "${TEST_IMAGE}" ]]; then
+  if [[ ! -f "${TEST_IMAGE}" ]]; then
+    warn "TEST_IMAGE is set but file does not exist: ${TEST_IMAGE}"
   else
-    warn "Could not determine a public hostname or IP automatically"
-  fi
-}
+    log "Running optional single-endpoint smoke test with TEST_IMAGE"
 
-main "$@"
+    SINGLE_OUT="$(mktemp)"
+    SINGLE_CODE="$(
+      curl -sS -o "${SINGLE_OUT}" -w "%{http_code}" \
+        -X POST "http://127.0.0.1/api/predict/single" \
+        -H "accept: application/json" \
+        -F "image=@${TEST_IMAGE}" \
+        -F "confidence=0.25" \
+        -F "iou=0.3" || true
+    )"
+
+    if [[ "${SINGLE_CODE}" =~ ^2 ]]; then
+      ok "Single inference smoke test passed -> HTTP ${SINGLE_CODE}"
+    else
+      err "Single inference smoke test failed -> HTTP ${SINGLE_CODE}"
+      echo "----- response body begin -----"
+      cat "${SINGLE_OUT}" || true
+      echo
+      echo "----- response body end -----"
+      warn "This means nginx/proxy is fine, but backend inference code is still failing internally."
+    fi
+
+    rm -f "${SINGLE_OUT}"
+  fi
+else
+  warn "Skipping real inference smoke test. Set TEST_IMAGE=/absolute/path/to/test.jpg to test /api/predict/single."
+fi
+
+############################################
+# Optional HTTPS setup
+############################################
+if [[ -n "${DOMAIN}" && -n "${CERTBOT_EMAIL}" ]]; then
+  if command -v certbot >/dev/null 2>&1; then
+    log "Attempting HTTPS with Let's Encrypt for ${DOMAIN}"
+    ${SUDO} certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${CERTBOT_EMAIL}" --redirect || {
+      warn "HTTPS setup failed. Check that:"
+      warn "1) ${DOMAIN} points to this VM"
+      warn "2) ports 80 and 443 are open"
+      warn "3) nginx is publicly reachable"
+    }
+  else
+    warn "certbot is not installed. HTTPS was not configured."
+  fi
+else
+  warn "HTTPS not configured."
+  warn "Browser 'Not secure' warning cannot be removed on raw http://IP."
+  warn "To remove it, use a real DNS hostname + valid TLS certificate."
+fi
+
+############################################
+# Final summary
+############################################
+BEST_FINAL_LINK="${BEST_HTTP_LINK}"
+if [[ -n "${DOMAIN}" ]]; then
+  # If HTTPS was configured successfully, this should work:
+  HTTPS_CODE="$(curl -k -sS -o /dev/null -w "%{http_code}" "https://${DOMAIN}/" || true)"
+  if [[ "${HTTPS_CODE}" =~ ^2|3 ]]; then
+    BEST_FINAL_LINK="https://${DOMAIN}/"
+  fi
+fi
+
+echo
+ok "testing completed"
+echo "Frontend local:    http://${FRONTEND_HOST}:${FRONTEND_PORT}/"
+echo "Backend local:     http://${BACKEND_HOST}:${BACKEND_PORT}/"
+echo "Nginx local:       http://127.0.0.1/"
+echo "Best final link:   ${BEST_FINAL_LINK}"
+
+FINAL_CODE="$(curl -sS -o /dev/null -w "%{http_code}" "${BEST_FINAL_LINK}" || true)"
+if [[ "${FINAL_CODE}" =~ ^2|3 ]]; then
+  ok "Final link responds locally: ${BEST_FINAL_LINK} (HTTP ${FINAL_CODE})"
+else
+  warn "Final link did not respond from this VM: ${BEST_FINAL_LINK} (HTTP ${FINAL_CODE})"
+fi
