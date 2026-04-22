@@ -1,297 +1,316 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$SCRIPT_DIR"
-BACKEND_DIR="$REPO_DIR/backend"
-MODELS_DIR="$BACKEND_DIR/models"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FRONTEND_LOCAL="http://127.0.0.1:3000"
+BACKEND_LOCAL="http://127.0.0.1:8000"
+MODELS_DIR="${ROOT_DIR}/backend/models"
 
-FRONTEND_LOCAL_URL="http://127.0.0.1:3000"
-BACKEND_LOCAL_URL="http://127.0.0.1:8000"
-NGINX_LOCAL_URL="http://127.0.0.1"
+NGINX_AVAIL="/etc/nginx/sites-available/layout-host"
+NGINX_ENABLED="/etc/nginx/sites-enabled/layout-host"
+NGINX_DEFAULT="/etc/nginx/sites-enabled/default"
 
-# ---------- pretty output ----------
-BLUE='\033[1;34m'
-GREEN='\033[1;32m'
-YELLOW='\033[1;33m'
-RED='\033[1;31m'
-NC='\033[0m'
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_PATH="${NGINX_AVAIL}.bak.${TS}"
 
-step() { echo -e "\n${BLUE}==>${NC} $*"; }
-ok()   { echo -e "${GREEN}OK${NC}  $*"; }
-warn() { echo -e "${YELLOW}!!${NC}  $*"; }
-fail() { echo -e "${RED}XX${NC}  $*"; }
+say()  { printf '\n==> %s\n' "$*"; }
+ok()   { printf 'OK  %s\n' "$*"; }
+warn() { printf '!!  %s\n' "$*" >&2; }
+die()  { printf 'XX  %s\n' "$*" >&2; exit 1; }
 
-# ---------- helpers ----------
-have_cmd() { command -v "$1" >/dev/null 2>&1; }
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
+}
 
 http_code() {
   local url="$1"
-  curl -L -sS -o /dev/null -w '%{http_code}' --max-time 12 "$url" 2>/dev/null || echo "000"
+  local timeout="${2:-20}"
+  curl -L -sS -o /dev/null -w '%{http_code}' --max-time "$timeout" "$url" 2>/dev/null || echo "000"
 }
 
-http_code_host() {
-  local host="$1"
+wait_http_ok() {
+  local name="$1"
   local url="$2"
-  curl -L -sS -o /dev/null -w '%{http_code}' --max-time 12 -H "Host: $host" "$url" 2>/dev/null || echo "000"
+  local tries="${3:-40}"
+  local delay="${4:-2}"
+
+  local i code
+  for (( i=1; i<=tries; i++ )); do
+    code="$(http_code "$url")"
+    if [[ "$code" =~ ^(200|201|202|204|301|302|307|308)$ ]]; then
+      ok "${name} is reachable: ${url} (${code})"
+      return 0
+    fi
+    sleep "$delay"
+  done
+
+  die "${name} did not become reachable: ${url}"
 }
 
-is_good_http() {
-  local code="$1"
-  [[ "$code" =~ ^2[0-9][0-9]$ || "$code" =~ ^3[0-9][0-9]$ ]]
-}
-
-first_line() {
-  awk 'NF {print; exit}'
-}
-
-resolve_ipv4() {
-  local host="$1"
-  getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | first_line || true
-}
-
-detect_public_ip() {
-  local ip=""
-  if have_cmd hostname; then
-    ip="$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i !~ /^127\./) {print $i; exit}}')"
-  fi
-  echo "$ip"
-}
-
-detect_public_fqdn() {
-  local fqdn=""
+best_host_candidate() {
+  local fqdn short ip
   fqdn="$(hostname -f 2>/dev/null || true)"
-  if [[ -n "$fqdn" && "$fqdn" != "localhost" && "$fqdn" != "localhost.localdomain" ]]; then
-    echo "$fqdn"
-    return
-  fi
-  echo ""
-}
+  short="$(hostname 2>/dev/null || true)"
+  ip="$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
 
-check_url() {
-  local label="$1"
-  local url="$2"
-  local code
-  code="$(http_code "$url")"
-  if is_good_http "$code"; then
-    ok "$label is reachable: $url [$code]"
+  if [[ -n "${fqdn}" && "${fqdn}" != "localhost" && "${fqdn}" == *.* ]]; then
+    printf '%s' "$fqdn"
     return 0
-  else
-    fail "$label is NOT reachable: $url [$code]"
-    return 1
   fi
-}
 
-check_url_with_host() {
-  local label="$1"
-  local host="$2"
-  local url="$3"
-  local code
-  code="$(http_code_host "$host" "$url")"
-  if is_good_http "$code"; then
-    ok "$label is reachable with Host=$host via $url [$code]"
+  if [[ -n "${ip}" ]]; then
+    printf '%s' "$ip"
     return 0
+  fi
+
+  if [[ -n "${short}" ]]; then
+    printf '%s' "$short"
+    return 0
+  fi
+
+  printf '127.0.0.1'
+}
+
+reload_or_start_nginx() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable nginx >/dev/null 2>&1 || true
+    systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+  fi
+
+  if command -v service >/dev/null 2>&1; then
+    service nginx reload >/dev/null 2>&1 || service nginx restart >/dev/null 2>&1 || true
+  fi
+
+  if pgrep -x nginx >/dev/null 2>&1; then
+    nginx -s reload >/dev/null 2>&1 || pkill -HUP nginx >/dev/null 2>&1 || true
   else
-    fail "$label is NOT reachable with Host=$host via $url [$code]"
-    return 1
+    nginx >/dev/null 2>&1 || true
+  fi
+
+  pgrep -x nginx >/dev/null 2>&1 || die "nginx is not running after reload/start attempts"
+}
+
+open_firewall_if_needed() {
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -qi "Status: active"; then
+      ufw allow 80/tcp >/dev/null 2>&1 || true
+      ufw allow 443/tcp >/dev/null 2>&1 || true
+      ok "ufw updated to allow 80/tcp and 443/tcp"
+    fi
   fi
 }
 
-# ---------- detect public identity ----------
-PUBLIC_IP="$(detect_public_ip)"
-PUBLIC_FQDN="$(detect_public_fqdn)"
-RESOLVED_FQDN_IP=""
+test_documented_routes() {
+  say "Testing documented API routes through nginx"
 
-if [[ -n "$PUBLIC_FQDN" ]]; then
-  RESOLVED_FQDN_IP="$(resolve_ipv4 "$PUBLIC_FQDN")"
-fi
+  python3 - <<'PY' "$BACKEND_LOCAL/openapi.json" "http://127.0.0.1"
+import json
+import sys
+import urllib.request
+import urllib.error
 
-# ---------- basic file checks ----------
-step "Checking repository layout"
-[[ -d "$BACKEND_DIR" ]] && ok "Backend directory found: $BACKEND_DIR" || { fail "Missing backend directory: $BACKEND_DIR"; exit 1; }
-[[ -d "$MODELS_DIR" ]] && ok "Models directory found: $MODELS_DIR" || { fail "Missing models directory: $MODELS_DIR"; exit 1; }
+openapi_url = sys.argv[1]
+base = sys.argv[2]
 
-step "Checking required model weights"
-REQUIRED_MODELS=(
-  "$MODELS_DIR/best_catmus.pt"
-  "$MODELS_DIR/best_emanuskript_segmentation.pt"
-  "$MODELS_DIR/best_zone_detection.pt"
-)
+try:
+    with urllib.request.urlopen(openapi_url, timeout=20) as r:
+        spec = json.loads(r.read().decode("utf-8"))
+except Exception as e:
+    print(f"XX  failed to read OpenAPI schema from {openapi_url}: {e}")
+    sys.exit(1)
 
-for model in "${REQUIRED_MODELS[@]}"; do
-  if [[ -f "$model" ]]; then
-    ok "Found model: $model"
-  else
-    fail "Missing model: $model"
-    exit 1
-  fi
+paths = spec.get("paths", {})
+if not paths:
+    print("XX  no paths found in OpenAPI schema")
+    sys.exit(1)
+
+for path in sorted(paths):
+    methods = paths[path]
+    for method in sorted(methods):
+        method_upper = method.upper()
+        if method_upper == "GET":
+            if "{" in path or "}" in path:
+                print(f"--  SKIP {method_upper} {path} (path params required)")
+                continue
+            url = base + path
+            try:
+                with urllib.request.urlopen(url, timeout=20) as r:
+                    print(f"OK  {method_upper} {path} -> {r.status}")
+            except urllib.error.HTTPError as e:
+                print(f"!!  {method_upper} {path} -> HTTP {e.code}")
+            except Exception as e:
+                print(f"XX  {method_upper} {path} -> {e}")
+        else:
+            print(f"--  FOUND {method_upper} {path}")
+PY
+}
+
+need_cmd curl
+need_cmd nginx
+need_cmd python3
+need_cmd ip
+
+[[ "${EUID}" -eq 0 ]] || die "Run this script with sudo: sudo bash ./testing.sh"
+
+say "Checking real project paths"
+[[ -d "${ROOT_DIR}/backend" ]] || die "Missing backend directory at ${ROOT_DIR}/backend"
+[[ -d "${ROOT_DIR}/frontend" ]] || die "Missing frontend directory at ${ROOT_DIR}/frontend"
+[[ -d "${MODELS_DIR}" ]] || die "Missing models directory at ${MODELS_DIR}"
+
+for f in \
+  "${MODELS_DIR}/best_catmus.pt" \
+  "${MODELS_DIR}/best_emanuskript_segmentation.pt" \
+  "${MODELS_DIR}/best_zone_detection.pt"
+do
+  [[ -f "$f" ]] || die "Missing model file: $f"
+  ok "Found model file: $f"
 done
 
-# ---------- process / port checks ----------
-step "Checking listening ports"
-if have_cmd ss; then
-  ss -ltnp 2>/dev/null | grep -E ':(80|3000|8000)\s' || warn "Did not see one or more expected listening ports in ss output"
+PUBLIC_HOST="$(best_host_candidate)"
+FINAL_FRONTEND_URL="http://${PUBLIC_HOST}/"
+FINAL_API_HEALTH_URL="http://${PUBLIC_HOST}/api/health"
+FINAL_DOCS_URL="http://${PUBLIC_HOST}/docs"
+FINAL_OPENAPI_URL="http://${PUBLIC_HOST}/openapi.json"
+
+HOST_FQDN="$(hostname -f 2>/dev/null || true)"
+PRIMARY_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+
+SERVER_NAMES="_"
+if [[ -n "${HOST_FQDN}" && "${HOST_FQDN}" != "localhost" ]]; then
+  SERVER_NAMES="${SERVER_NAMES} ${HOST_FQDN}"
+fi
+if [[ -n "${PRIMARY_IP}" ]]; then
+  SERVER_NAMES="${SERVER_NAMES} ${PRIMARY_IP}"
+fi
+
+say "Preflight: verifying local services"
+wait_http_ok "frontend local" "${FRONTEND_LOCAL}/"
+wait_http_ok "backend local health" "${BACKEND_LOCAL}/api/health"
+wait_http_ok "backend local openapi" "${BACKEND_LOCAL}/openapi.json"
+
+say "Backing up existing nginx config"
+mkdir -p "$(dirname "$NGINX_AVAIL")" "$(dirname "$NGINX_ENABLED")"
+if [[ -f "$NGINX_AVAIL" ]]; then
+  cp -f "$NGINX_AVAIL" "$BACKUP_PATH"
+  ok "Backed up nginx config to $BACKUP_PATH"
 else
-  warn "ss not available; skipping port inspection"
+  ok "No previous nginx config found at $NGINX_AVAIL"
 fi
 
-# ---------- service checks ----------
-step "Checking nginx process"
-if pgrep -x nginx >/dev/null 2>&1; then
-  ok "nginx process is running"
+say "Writing clean nginx config"
+cat > "$NGINX_AVAIL" <<EOF
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name ${SERVER_NAMES};
+
+    client_max_body_size 500M;
+    proxy_connect_timeout 600s;
+    proxy_send_timeout 600s;
+    proxy_read_timeout 600s;
+    send_timeout 600s;
+
+    location = /api {
+        return 301 /api/;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /docs {
+        proxy_pass http://127.0.0.1:8000/docs;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location /docs/ {
+        proxy_pass http://127.0.0.1:8000/docs/;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /openapi.json {
+        proxy_pass http://127.0.0.1:8000/openapi.json;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /redoc {
+        proxy_pass http://127.0.0.1:8000/redoc;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+    }
+}
+EOF
+
+say "Relinking nginx sites-enabled"
+ln -sfn "$NGINX_AVAIL" "$NGINX_ENABLED"
+rm -f "$NGINX_DEFAULT" || true
+
+say "Testing nginx syntax"
+nginx -t
+
+say "Reloading or starting nginx"
+reload_or_start_nginx
+
+say "Opening firewall if needed"
+open_firewall_if_needed
+
+say "Waiting for nginx-routed endpoints"
+wait_http_ok "nginx local frontend" "http://127.0.0.1/"
+wait_http_ok "nginx local API health" "http://127.0.0.1/api/health"
+wait_http_ok "nginx local docs" "http://127.0.0.1/docs"
+wait_http_ok "nginx local openapi" "http://127.0.0.1/openapi.json"
+
+say "Testing final externally usable host from the VM"
+wait_http_ok "final frontend URL" "${FINAL_FRONTEND_URL}"
+wait_http_ok "final API health URL" "${FINAL_API_HEALTH_URL}"
+wait_http_ok "final docs URL" "${FINAL_DOCS_URL}"
+wait_http_ok "final openapi URL" "${FINAL_OPENAPI_URL}"
+
+test_documented_routes
+
+say "Final result"
+printf 'Frontend URL : %s\n' "$FINAL_FRONTEND_URL"
+printf 'API health   : %s\n' "$FINAL_API_HEALTH_URL"
+printf 'API docs     : %s\n' "$FINAL_DOCS_URL"
+printf 'OpenAPI JSON : %s\n' "$FINAL_OPENAPI_URL"
+
+if [[ -n "${HOST_FQDN}" && "${HOST_FQDN}" == *.* ]]; then
+  ok "Preferred public hostname: http://${HOST_FQDN}/"
 else
-  fail "nginx process is not running"
+  warn "No public FQDN detected; using IP-based URL instead"
 fi
 
-if have_cmd systemctl; then
-  if systemctl is-active --quiet nginx; then
-    ok "nginx service is active"
-  else
-    warn "nginx service is not active according to systemctl"
-  fi
-fi
-
-# ---------- local URL checks ----------
-step "Checking local endpoints"
-check_url "frontend local root" "$FRONTEND_LOCAL_URL/"
-check_url "backend local openapi" "$BACKEND_LOCAL_URL/openapi.json"
-check_url "backend local health" "$BACKEND_LOCAL_URL/api/health"
-check_url "nginx local root" "$NGINX_LOCAL_URL/"
-check_url "backend through nginx local" "$NGINX_LOCAL_URL/api/health"
-
-# ---------- API route discovery ----------
-step "Inspecting backend OpenAPI for expected routes"
-OPENAPI_TMP="$(mktemp)"
-if curl -fsS --max-time 12 "$BACKEND_LOCAL_URL/openapi.json" -o "$OPENAPI_TMP"; then
-  ok "Downloaded OpenAPI spec"
-  grep -oE '"/api/[^"]+' "$OPENAPI_TMP" | tr -d '"' | sort -u || true
-
-  echo
-  echo "Likely health endpoints:"
-  grep -oE '/api/health[^", ]*' "$OPENAPI_TMP" | sort -u || true
-
-  echo
-  echo "Likely model/analyze endpoints:"
-  grep -oE '/api/[^", ]*(predict|analy|class|download)[^", ]*' "$OPENAPI_TMP" | sort -u || true
-else
-  warn "Could not fetch OpenAPI spec from backend"
-fi
-rm -f "$OPENAPI_TMP"
-
-# ---------- hostname / DNS checks ----------
-step "Checking public hostname and DNS"
-
-if [[ -n "$PUBLIC_FQDN" ]]; then
-  ok "Detected VM hostname: $PUBLIC_FQDN"
-else
-  warn "No FQDN detected from hostname -f"
-fi
-
-if [[ -n "$PUBLIC_IP" ]]; then
-  ok "Detected VM IP: $PUBLIC_IP"
-else
-  warn "Could not detect a non-loopback IP from hostname -I"
-fi
-
-if [[ -n "$PUBLIC_FQDN" && -n "$RESOLVED_FQDN_IP" ]]; then
-  ok "Hostname resolves in DNS: $PUBLIC_FQDN -> $RESOLVED_FQDN_IP"
-  if [[ -n "$PUBLIC_IP" && "$PUBLIC_IP" != "$RESOLVED_FQDN_IP" ]]; then
-    warn "DNS IP does not match detected host IP"
-    warn "Detected host IP: $PUBLIC_IP"
-    warn "Resolved DNS IP:  $RESOLVED_FQDN_IP"
-  fi
-elif [[ -n "$PUBLIC_FQDN" ]]; then
-  warn "Hostname exists locally but does not resolve via getent: $PUBLIC_FQDN"
-fi
-
-# ---------- Host-header nginx checks ----------
-step "Checking nginx routing with Host header"
-
-if [[ -n "$PUBLIC_FQDN" ]]; then
-  check_url_with_host "nginx root using public hostname locally" "$PUBLIC_FQDN" "$NGINX_LOCAL_URL/"
-  check_url_with_host "nginx /api/health using public hostname locally" "$PUBLIC_FQDN" "$NGINX_LOCAL_URL/api/health"
-else
-  warn "Skipping Host-header test because no public hostname was detected"
-fi
-
-# ---------- public reachability checks ----------
-step "Checking likely public URLs"
-
-FINAL_URL=""
-FINAL_OK=0
-
-if [[ -n "$PUBLIC_FQDN" ]]; then
-  FQDN_URL="http://$PUBLIC_FQDN/"
-  FQDN_API_URL="http://$PUBLIC_FQDN/api/health"
-
-  FQDN_ROOT_CODE="$(http_code "$FQDN_URL")"
-  FQDN_API_CODE="$(http_code "$FQDN_API_URL")"
-
-  if is_good_http "$FQDN_ROOT_CODE"; then
-    ok "Public hostname root reachable: $FQDN_URL [$FQDN_ROOT_CODE]"
-    FINAL_URL="$FQDN_URL"
-    FINAL_OK=1
-  else
-    warn "Public hostname root not reachable yet: $FQDN_URL [$FQDN_ROOT_CODE]"
-  fi
-
-  if is_good_http "$FQDN_API_CODE"; then
-    ok "Public hostname API reachable: $FQDN_API_URL [$FQDN_API_CODE]"
-  else
-    warn "Public hostname API not reachable yet: $FQDN_API_URL [$FQDN_API_CODE]"
-  fi
-fi
-
-if [[ $FINAL_OK -eq 0 && -n "$PUBLIC_IP" ]]; then
-  IP_URL="http://$PUBLIC_IP/"
-  IP_API_URL="http://$PUBLIC_IP/api/health"
-
-  IP_ROOT_CODE="$(http_code "$IP_URL")"
-  IP_API_CODE="$(http_code "$IP_API_URL")"
-
-  if is_good_http "$IP_ROOT_CODE"; then
-    ok "Public IP root reachable: $IP_URL [$IP_ROOT_CODE]"
-    FINAL_URL="$IP_URL"
-    FINAL_OK=1
-  else
-    warn "Public IP root not reachable yet: $IP_URL [$IP_ROOT_CODE]"
-  fi
-
-  if is_good_http "$IP_API_CODE"; then
-    ok "Public IP API reachable: $IP_API_URL [$IP_API_CODE]"
-  else
-    warn "Public IP API not reachable yet: $IP_API_URL [$IP_API_CODE]"
-  fi
-fi
-
-# ---------- firewall hints ----------
-step "Checking local firewall hints"
-
-if have_cmd ufw; then
-  ufw status || true
-else
-  warn "ufw not installed"
-fi
-
-# ---------- summary ----------
-step "Summary"
-
-echo "Frontend local:   $FRONTEND_LOCAL_URL"
-echo "Backend local:    $BACKEND_LOCAL_URL"
-echo "Nginx local:      $NGINX_LOCAL_URL"
-echo "Detected FQDN:    ${PUBLIC_FQDN:-<none>}"
-echo "Detected IP:      ${PUBLIC_IP:-<none>}"
-
-if [[ $FINAL_OK -eq 1 ]]; then
-  ok "Final public URL candidate: $FINAL_URL"
-else
-  fail "No globally reachable URL was confirmed from this VM"
-  echo
-  echo "Most likely causes:"
-  echo "  1) DNS/hostname is missing or wrong"
-  echo "  2) Port 80 is blocked by VM/provider firewall"
-  echo "  3) nginx is serving locally but not reachable externally"
-  exit 2
-fi
-
-ok "testing completed"
+ok "testing.sh completed successfully"
