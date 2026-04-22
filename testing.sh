@@ -1,180 +1,372 @@
 #!/usr/bin/env bash
-set -u
+set -Eeuo pipefail
 
-PUBLIC_URL="${1:-http://134.76.19.184}"
-LOCAL_FRONTEND="http://127.0.0.1:3000"
-LOCAL_BACKEND="http://127.0.0.1:8000"
-OPENAPI_URL="$LOCAL_BACKEND/openapi.json"
+###############################################################################
+# EDIT THESE
+###############################################################################
+FRONTEND_PORT="${FRONTEND_PORT:-3000}"
+BACKEND_PORT="${BACKEND_PORT:-8000}"
+NGINX_SITE_NAME="${NGINX_SITE_NAME:-layout-host}"
+SERVER_NAME="${SERVER_NAME:-_}"
 
-blue='\033[1;34m'
-green='\033[1;32m'
-yellow='\033[1;33m'
-red='\033[1;31m'
-nc='\033[0m'
+# Put your 3 FULL weight files here, absolute paths.
+EXPECTED_WEIGHT_FILES=(
+  "/ABSOLUTE/PATH/TO/weight_1.pt"
+  "/ABSOLUTE/PATH/TO/weight_2.pt"
+  "/ABSOLUTE/PATH/TO/weight_3.pt"
+)
 
-say()  { echo -e "${blue}==>${nc} $*"; }
-ok()   { echo -e "${green}OK${nc}  $*"; }
-warn() { echo -e "${yellow}!!${nc}  $*"; }
-fail() { echo -e "${red}XX${nc}  $*"; }
+###############################################################################
+# Helpers
+###############################################################################
+BLUE='\033[1;34m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+RED='\033[1;31m'
+NC='\033[0m'
 
-code_of() {
-  curl -sS -o /dev/null -w "%{http_code}" "$1" 2>/dev/null || echo "000"
+info() { echo -e "${BLUE}==> $*${NC}"; }
+ok()   { echo -e "${GREEN}OK  $*${NC}"; }
+warn() { echo -e "${YELLOW}!!  $*${NC}"; }
+err()  { echo -e "${RED}XX  $*${NC}" >&2; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+http_code() {
+  local url="$1"
+  curl -k -L -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url" 2>/dev/null || true
 }
 
-head_code_of() {
-  curl -sS -o /dev/null -I -w "%{http_code}" "$1" 2>/dev/null || echo "000"
+wait_http() {
+  local url="$1"
+  local tries="${2:-20}"
+  local sleep_s="${3:-2}"
+  local i code
+  for ((i=1; i<=tries; i++)); do
+    code="$(http_code "$url")"
+    if [[ "$code" =~ ^2|3 ]]; then
+      return 0
+    fi
+    sleep "$sleep_s"
+  done
+  return 1
 }
 
-show_redirect() {
-  curl -sS -o /dev/null -w "%{redirect_url}" "$1" 2>/dev/null
+first_ok_url() {
+  local code url
+  for url in "$@"; do
+    code="$(http_code "$url")"
+    if [[ "$code" =~ ^2|3 ]]; then
+      printf '%s\n' "$url"
+      return 0
+    fi
+  done
+  return 1
 }
 
-TMP_OPENAPI="$(mktemp)"
-TMP_IMG="$(mktemp --suffix=.png)"
-
-cleanup() {
-  rm -f "$TMP_OPENAPI" "$TMP_IMG"
-}
-trap cleanup EXIT
-
-say "Checking local endpoints"
-for u in \
-  "$LOCAL_FRONTEND" \
-  "$LOCAL_BACKEND/api/health" \
-  "$LOCAL_BACKEND/openapi.json"
-do
-  c="$(code_of "$u")"
-  if [ "$c" = "200" ]; then
-    ok "$u -> $c"
-  else
-    fail "$u -> $c"
+show_listener() {
+  local port="$1"
+  if have ss; then
+    ss -ltnp 2>/dev/null | awk -v p=":$port" '$4 ~ p {print}'
+  elif have netstat; then
+    netstat -ltnp 2>/dev/null | awk -v p=":$port" '$4 ~ p {print}'
   fi
-done
+}
 
-say "Fetching OpenAPI"
-if ! curl -fsS "$OPENAPI_URL" -o "$TMP_OPENAPI"; then
-  fail "Could not fetch $OPENAPI_URL"
-  exit 1
-fi
-ok "OpenAPI downloaded"
+reload_nginx() {
+  info "Reloading nginx"
 
-say "Extracting important backend paths"
-python3 - <<'PY' "$TMP_OPENAPI"
+  if have nginx; then
+    nginx -t
+  fi
+
+  if have systemctl && systemctl list-unit-files --type=service 2>/dev/null | grep -q '^nginx\.service'; then
+    systemctl reload nginx || systemctl restart nginx
+    return 0
+  fi
+
+  if have service; then
+    service nginx reload || service nginx restart || true
+  fi
+
+  if have nginx; then
+    nginx -s reload || true
+  fi
+}
+
+maybe_restart_service() {
+  local svc="$1"
+
+  if have systemctl && systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${svc}\.service"; then
+    info "Restarting service: $svc"
+    systemctl restart "$svc"
+    return 0
+  fi
+
+  if have service && service "$svc" status >/dev/null 2>&1; then
+    info "Restarting service: $svc"
+    service "$svc" restart
+    return 0
+  fi
+
+  warn "Service not managed here or not installed: $svc"
+  return 1
+}
+
+pretty_json() {
+  local url="$1"
+  local label="$2"
+  echo "$label"
+  curl -k -L -sS --max-time 15 "$url" 2>/dev/null | python3 - <<'PY' || true
 import json, sys
-p = json.load(open(sys.argv[1]))
-paths = p.get("paths", {})
-print("Declared paths:")
-for path in sorted(paths):
-    if path.startswith("/api/"):
-        print(" ", path)
-print()
-print("Likely health paths:")
-for path in sorted(paths):
-    if "health" in path.lower() or "ping" in path.lower():
-        print(" ", path)
-print()
-print("Likely prediction/model paths:")
-for path in sorted(paths):
-    low = path.lower()
-    if any(x in low for x in ["predict", "class", "model", "analy", "download"]):
-        print(" ", path)
-print()
-if "/api/predict/single" in paths:
-    print("Methods for /api/predict/single:", ",".join(paths["/api/predict/single"].keys()))
+data = sys.stdin.read().strip()
+if not data:
+    print("(empty)")
+    raise SystemExit(0)
+try:
+    obj = json.loads(data)
+    print(json.dumps(obj, indent=2, ensure_ascii=False)[:4000])
+except Exception:
+    print(data[:4000])
 PY
+}
 
-say "Testing local backend routes"
-for p in \
-  "/api/health" \
-  "/api/classes" \
-  "/api/predict/single" \
-  "/api/predict/batch"
-do
-  c="$(code_of "$LOCAL_BACKEND$p")"
-  echo "local  $p -> $c"
-done
+###############################################################################
+# Model weight checks
+###############################################################################
+check_weights() {
+  info "Checking model weights"
+  local missing=0
+  local f
 
-say "Testing public proxy routes"
-for p in \
-  "/" \
-  "/api/health" \
-  "/api/classes" \
-  "/api/predict/single" \
-  "/api/predict/batch"
-do
-  c="$(code_of "$PUBLIC_URL$p")"
-  echo "public $p -> $c"
-done
+  if [[ "${#EXPECTED_WEIGHT_FILES[@]}" -ne 3 ]]; then
+    err "EXPECTED_WEIGHT_FILES must contain exactly 3 entries"
+    exit 1
+  fi
 
-say "Checking redirects"
-r="$(show_redirect "$PUBLIC_URL")"
-if [ -n "$r" ]; then
-  warn "Public root redirects to: $r"
-else
-  ok "Public root does not redirect"
-fi
+  for f in "${EXPECTED_WEIGHT_FILES[@]}"; do
+    if [[ "$f" == "/ABSOLUTE/PATH/TO/"* ]]; then
+      warn "Weight path still placeholder: $f"
+      missing=1
+      continue
+    fi
 
-say "Checking frontend for hardcoded localhost / wrong API base"
-grep -RInE "127\.0\.0\.1|localhost|/analyze|http://134\.76\.19\.184|duckdns" . \
-  --exclude-dir=.git \
-  --exclude=testing.sh \
-  --exclude=fix.sh \
-  --exclude=package-lock.json 2>/dev/null || true
+    if [[ -s "$f" ]]; then
+      ok "Found weight: $f ($(du -h "$f" | awk '{print $1}'))"
+    else
+      err "Missing or empty weight: $f"
+      missing=1
+    fi
+  done
 
-say "Checking likely model weight files"
-find . \
-  \( -iname "*.pt" -o -iname "*.pth" -o -iname "*.onnx" -o -iname "*.engine" \) \
-  -type f -printf "%s %p\n" 2>/dev/null \
-| sort -nr | head -20 \
-| awk '{
-    size=$1;
-    $1="";
-    if (size>1073741824) hum=sprintf("%.2f GB", size/1073741824);
-    else if (size>1048576) hum=sprintf("%.2f MB", size/1048576);
-    else hum=sprintf("%.2f KB", size/1024);
-    print hum " " substr($0,2);
-  }'
+  if [[ "$missing" -ne 0 ]]; then
+    err "Fix the weight paths above before trusting this deployment"
+    exit 1
+  fi
+}
 
-say "Counting likely weight files"
-COUNT="$(find . \( -iname "*.pt" -o -iname "*.pth" -o -iname "*.onnx" -o -iname "*.engine" \) -type f 2>/dev/null | wc -l | tr -d ' ')"
-echo "Weight file count: $COUNT"
+###############################################################################
+# Nginx config
+###############################################################################
+write_nginx_config() {
+  local site_file="/etc/nginx/sites-available/${NGINX_SITE_NAME}"
+  local backup_file="${site_file}.bak.$(date +%Y%m%d_%H%M%S)"
 
-say "Making a tiny test image"
-python3 - <<'PY' "$TMP_IMG"
-import base64, sys
-png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9p2ZY3sAAAAASUVORK5CYII="
-open(sys.argv[1], "wb").write(base64.b64decode(png_b64))
-PY
-ok "Tiny PNG created at $TMP_IMG"
+  info "Writing clean nginx config"
 
-say "Inspecting request schema for /api/predict/single"
-python3 - <<'PY' "$TMP_OPENAPI"
-import json, sys
-doc = json.load(open(sys.argv[1]))
-path = doc.get("paths", {}).get("/api/predict/single", {})
-post = path.get("post", {})
-rb = post.get("requestBody", {})
-content = rb.get("content", {})
-mp = content.get("multipart/form-data", {})
-schema = mp.get("schema", {})
-print(json.dumps(schema, indent=2))
-PY
+  if [[ -f "$site_file" ]]; then
+    cp "$site_file" "$backup_file"
+    ok "Backed up nginx config to $backup_file"
+  fi
 
-say "Probing predict endpoint with OPTIONS"
-for base in "$LOCAL_BACKEND" "$PUBLIC_URL"; do
-  c="$(curl -sS -o /dev/null -X OPTIONS -w "%{http_code}" "$base/api/predict/single" 2>/dev/null || echo 000)"
-  echo "$base/api/predict/single OPTIONS -> $c"
-done
+  cat > "$site_file" <<EOF
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name ${SERVER_NAME};
 
-say "Testing /api/classes response"
-for base in "$LOCAL_BACKEND" "$PUBLIC_URL"; do
-  echo "----- $base/api/classes"
-  curl -sS "$base/api/classes" 2>/dev/null | head -c 500
+    client_max_body_size 512M;
+    proxy_connect_timeout 600s;
+    proxy_send_timeout 600s;
+    proxy_read_timeout 600s;
+    send_timeout 600s;
+
+    # Frontend
+    location / {
+        proxy_pass http://127.0.0.1:${FRONTEND_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    # Make FastAPI schema/docs available under /api/* even if backend serves them at root.
+    location = /api/openapi.json {
+        proxy_pass http://127.0.0.1:${BACKEND_PORT}/openapi.json;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /api/docs {
+        proxy_pass http://127.0.0.1:${BACKEND_PORT}/docs;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location = /api/redoc {
+        proxy_pass http://127.0.0.1:${BACKEND_PORT}/redoc;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    # Backend API routes already live under /api/*
+    location /api/ {
+        proxy_pass http://127.0.0.1:${BACKEND_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
+EOF
+
+  info "Relinking sites-enabled"
+  ln -sfn "$site_file" "/etc/nginx/sites-enabled/${NGINX_SITE_NAME}"
+
+  info "Testing nginx syntax"
+  nginx -t
+  ok "nginx syntax is valid"
+}
+
+###############################################################################
+# Endpoint discovery
+###############################################################################
+discover_backend() {
+  info "Discovering backend routes"
+
+  BACKEND_LOCAL="http://127.0.0.1:${BACKEND_PORT}"
+  FRONTEND_LOCAL="http://127.0.0.1:${FRONTEND_PORT}"
+  NGINX_LOCAL="http://127.0.0.1"
+
+  BACKEND_HEALTH_URL="$(first_ok_url \
+    "${BACKEND_LOCAL}/api/health" \
+    "${BACKEND_LOCAL}/health" \
+    "${BACKEND_LOCAL}/ping" || true)"
+
+  BACKEND_OPENAPI_URL="$(first_ok_url \
+    "${BACKEND_LOCAL}/openapi.json" \
+    "${BACKEND_LOCAL}/api/openapi.json" || true)"
+
+  BACKEND_CLASSES_URL="$(first_ok_url \
+    "${BACKEND_LOCAL}/api/classes" \
+    "${BACKEND_LOCAL}/classes" || true)"
+
+  [[ -n "${BACKEND_HEALTH_URL}" ]]  && ok "backend health local is reachable: ${BACKEND_HEALTH_URL}" \
+                                    || warn "No backend health endpoint found locally"
+  [[ -n "${BACKEND_OPENAPI_URL}" ]] && ok "backend openapi local is reachable: ${BACKEND_OPENAPI_URL}" \
+                                    || warn "No backend openapi endpoint found locally"
+  [[ -n "${BACKEND_CLASSES_URL}" ]] && ok "backend classes local is reachable: ${BACKEND_CLASSES_URL}" \
+                                    || warn "No backend classes endpoint found locally"
+}
+
+###############################################################################
+# Main checks
+###############################################################################
+main() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    err "Run this script with sudo: sudo bash ./testing.sh"
+    exit 1
+  fi
+
+  check_weights
+
+  discover_backend
+  write_nginx_config
+  reload_nginx
+
+  # Optional service restarts if they actually exist as units on this host.
+  info "Trying known app service names (best effort)"
+  maybe_restart_service "layout-backend" || true
+  maybe_restart_service "layout-frontend" || true
+  maybe_restart_service "backend" || true
+  maybe_restart_service "frontend" || true
+
+  info "Service / listener status"
+  echo "Frontend listeners:"
+  show_listener "$FRONTEND_PORT" || true
   echo
-done
+  echo "Backend listeners:"
+  show_listener "$BACKEND_PORT" || true
+  echo
+  echo "Nginx listeners:"
+  show_listener "80" || true
+  echo
 
-echo
-ok "testing completed"
-echo "Public URL:      $PUBLIC_URL"
-echo "Frontend local:  $LOCAL_FRONTEND"
-echo "Backend local:   $LOCAL_BACKEND"
+  info "Waiting for endpoints"
+  wait_http "${FRONTEND_LOCAL}" 20 2 \
+    && ok "frontend local is reachable: ${FRONTEND_LOCAL}" \
+    || err "frontend local did not become reachable: ${FRONTEND_LOCAL}"
+
+  if [[ -n "${BACKEND_OPENAPI_URL}" ]]; then
+    wait_http "${BACKEND_OPENAPI_URL}" 20 2 \
+      && ok "backend openapi local is reachable: ${BACKEND_OPENAPI_URL}" \
+      || err "backend openapi local did not become reachable: ${BACKEND_OPENAPI_URL}"
+  fi
+
+  NGINX_HEALTH_URL="$(first_ok_url \
+    "${NGINX_LOCAL}/api/health" \
+    "${NGINX_LOCAL}/health" || true)"
+
+  NGINX_OPENAPI_URL="$(first_ok_url \
+    "${NGINX_LOCAL}/api/openapi.json" \
+    "${NGINX_LOCAL}/openapi.json" || true)"
+
+  NGINX_CLASSES_URL="$(first_ok_url \
+    "${NGINX_LOCAL}/api/classes" \
+    "${NGINX_LOCAL}/classes" || true)"
+
+  [[ -n "${NGINX_HEALTH_URL}" ]]  && ok "backend health through nginx is reachable: ${NGINX_HEALTH_URL}" \
+                                  || err "backend health through nginx did not become reachable"
+
+  [[ -n "${NGINX_OPENAPI_URL}" ]] && ok "backend openapi through nginx is reachable: ${NGINX_OPENAPI_URL}" \
+                                  || err "backend openapi through nginx did not become reachable"
+
+  [[ -n "${NGINX_CLASSES_URL}" ]] && ok "backend classes through nginx is reachable: ${NGINX_CLASSES_URL}" \
+                                  || warn "backend classes through nginx not found"
+
+  if [[ -n "${BACKEND_CLASSES_URL}" ]]; then
+    pretty_json "${BACKEND_CLASSES_URL}" "Local classes payload:"
+  fi
+
+  if [[ -n "${NGINX_CLASSES_URL}" ]]; then
+    pretty_json "${NGINX_CLASSES_URL}" "Nginx classes payload:"
+  fi
+
+  PUBLIC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  PUBLIC_URL=""
+  [[ -n "${PUBLIC_IP}" ]] && PUBLIC_URL="http://${PUBLIC_IP}"
+
+  echo
+  ok "testing completed"
+  echo "Frontend local: ${FRONTEND_LOCAL}"
+  echo "Backend local:  ${BACKEND_LOCAL}"
+  echo "Nginx local:    ${NGINX_LOCAL}"
+  [[ -n "${PUBLIC_URL}" ]] && echo "Public URL:      ${PUBLIC_URL}"
+}
+
+main "$@"
