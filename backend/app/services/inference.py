@@ -1,7 +1,7 @@
 """Model pool management and parallel YOLO inference."""
 
+import logging
 import os
-import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict
@@ -9,24 +9,26 @@ from typing import Dict
 from app.config import settings
 from app.core.constants import MODEL_CLASSES
 
+logger = logging.getLogger(__name__)
+
 # Per-process model cache
 _worker_models: dict = {}
 _model_pool: ProcessPoolExecutor | None = None
 
 
 def _worker_init():
-    """Initialize worker process — models are loaded lazily on first use."""
+    """Initialize worker process; models are loaded lazily on first use."""
     global _worker_models
     _worker_models = {}
 
 
 def _run_single_model(args: tuple) -> tuple[str, str]:
-    """Run a single YOLO model prediction in a worker process.
-
-    Models are cached per-process to avoid reloading on subsequent calls.
-    """
+    """Run a single YOLO model prediction in a worker process."""
     global _worker_models
-    model_name, model_path, image_path, output_dir, classes = args
+    model_name, model_path, image_path, output_dir, classes, confidence, iou = args
+
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"Model file not found for {model_name}: {model_path}")
 
     if model_name not in _worker_models:
         from ultralytics import YOLO
@@ -40,7 +42,8 @@ def _run_single_model(args: tuple) -> tuple[str, str]:
 
     predict_kwargs = {
         "device": "cpu",
-        "iou": 0.3,
+        "conf": confidence,
+        "iou": iou,
         "augment": False,
         "stream": False,
     }
@@ -48,6 +51,8 @@ def _run_single_model(args: tuple) -> tuple[str, str]:
         predict_kwargs["classes"] = classes
 
     results = model.predict(image_path, **predict_kwargs)
+    if not results:
+        raise RuntimeError(f"{model_name} returned no prediction results")
 
     image_id = Path(image_path).stem
     json_path = os.path.join(model_dir, f"{image_id}.json")
@@ -65,7 +70,7 @@ def init_model_pool():
             max_workers=settings.max_pool_workers,
             initializer=_worker_init,
         )
-        print("Model worker pool initialized.", flush=True)
+        logger.info("Model worker pool initialized.")
 
 
 def shutdown_model_pool():
@@ -76,15 +81,36 @@ def shutdown_model_pool():
         _model_pool = None
 
 
-def run_models_parallel(image_path: str, output_dir: str) -> Dict[str, str]:
-    """Run all 3 YOLO models in parallel using the pre-initialized pool.
+def _validate_model_files() -> None:
+    missing = [
+        f"{name}: {path}"
+        for name, path in settings.required_model_paths.items()
+        if not os.path.isfile(path)
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Missing model weight file(s). "
+            + "Expected files at: "
+            + "; ".join(missing)
+        )
 
-    Returns:
-        Dict mapping model name to its labels folder path.
-    """
+
+def run_models_parallel(
+    image_path: str,
+    output_dir: str,
+    confidence: float = 0.25,
+    iou: float = 0.3,
+) -> Dict[str, str]:
+    """Run all 3 YOLO models in parallel using the pre-initialized pool."""
     global _model_pool
     if _model_pool is None:
         init_model_pool()
+
+    if not os.path.isfile(image_path):
+        raise FileNotFoundError(f"Input image not found: {image_path}")
+
+    _validate_model_files()
+    os.makedirs(output_dir, exist_ok=True)
 
     model_args = [
         (
@@ -93,6 +119,8 @@ def run_models_parallel(image_path: str, output_dir: str) -> Dict[str, str]:
             image_path,
             output_dir,
             MODEL_CLASSES["emanuskript"],
+            confidence,
+            iou,
         ),
         (
             "catmus",
@@ -100,6 +128,8 @@ def run_models_parallel(image_path: str, output_dir: str) -> Dict[str, str]:
             image_path,
             output_dir,
             MODEL_CLASSES["catmus"],
+            confidence,
+            iou,
         ),
         (
             "zone",
@@ -107,6 +137,8 @@ def run_models_parallel(image_path: str, output_dir: str) -> Dict[str, str]:
             image_path,
             output_dir,
             MODEL_CLASSES["zone"],
+            confidence,
+            iou,
         ),
     ]
 
@@ -115,7 +147,15 @@ def run_models_parallel(image_path: str, output_dir: str) -> Dict[str, str]:
     results: Dict[str, str] = {}
     for future in as_completed(futures):
         model_name = futures[future]
-        name, dir_path = future.result(timeout=300)
-        results[name] = dir_path
+        try:
+            name, dir_path = future.result(timeout=300)
+            results[name] = dir_path
+        except Exception as exc:
+            logger.exception(
+                "Model inference failed: model=%s image=%s",
+                model_name,
+                image_path,
+            )
+            raise RuntimeError(f"{model_name} inference failed: {exc}") from exc
 
     return results

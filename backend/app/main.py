@@ -1,12 +1,56 @@
+import logging
 import multiprocessing as mp
+import os
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.routers import analytics, classes, download, health, predict
 from app.services.inference import init_model_pool, shutdown_model_pool
-from app.routers import health, classes, predict, download, analytics
+
+logger = logging.getLogger(__name__)
+
+
+def _is_dir_writable(path: str) -> bool:
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, ".write_probe")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        logger.exception("Directory is not writable: %s", path)
+        return False
+
+
+def _log_startup_checks() -> None:
+    logger.info("Startup diagnostics: cwd=%s", os.getcwd())
+    logger.info("Resolved backend root: %s", settings.backend_root)
+    logger.info("Resolved model directory: %s", settings.model_dir)
+
+    model_dir_exists = os.path.isdir(settings.model_dir)
+    logger.info("Model directory exists: %s", model_dir_exists)
+
+    for name, model_path in settings.required_model_paths.items():
+        logger.info(
+            "Model file [%s]: path=%s exists=%s",
+            name,
+            model_path,
+            os.path.isfile(model_path),
+        )
+
+    task_dir_exists = os.path.isdir(settings.task_base_dir)
+    task_dir_writable = _is_dir_writable(settings.task_base_dir)
+    logger.info(
+        "Task directory: path=%s exists=%s writable=%s",
+        settings.task_base_dir,
+        task_dir_exists,
+        task_dir_writable,
+    )
 
 
 @asynccontextmanager
@@ -17,6 +61,7 @@ async def lifespan(app: FastAPI):
     except RuntimeError:
         pass
 
+    _log_startup_checks()
     init_model_pool()
     yield
     shutdown_model_pool()

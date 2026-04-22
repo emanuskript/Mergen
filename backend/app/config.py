@@ -1,18 +1,40 @@
 import os
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
+
+
+def _resolve_backend_root() -> Path:
+    """Resolve the backend root even if modules are loaded from __pycache__."""
+    module_dir = Path(__file__).resolve().parent
+
+    # When running from sourceless bytecode, __file__ can be:
+    # backend/app/__pycache__/config.cpython-311.pyc
+    if module_dir.name == "__pycache__":
+        module_dir = module_dir.parent
+
+    if module_dir.name == "app":
+        return module_dir.parent
+    if module_dir.name == "backend":
+        return module_dir
+
+    return module_dir.parent
+
+
+BACKEND_ROOT = _resolve_backend_root()
 
 
 class Settings(BaseSettings):
     # CORS
     cors_origins: str = "http://localhost:3000"
 
-    # Model paths
-    model_dir: str = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
+    # Paths
+    backend_root: str = str(BACKEND_ROOT)
+    model_dir: str = str(BACKEND_ROOT / "models")
+    task_base_dir: str = str(BACKEND_ROOT / ".tasks")
 
     # Analytics
-    analytics_db_path: str = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)), "analytics.db"
-    )
+    analytics_db_path: str = str(BACKEND_ROOT / "analytics.db")
     analytics_username: str = "admin"
     analytics_password: str = "layout2024"
 
@@ -26,7 +48,7 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins_list(self) -> list[str]:
-        return [o.strip() for o in self.cors_origins.split(",")]
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     @property
     def emanuskript_model_path(self) -> str:
@@ -39,6 +61,14 @@ class Settings(BaseSettings):
     @property
     def zone_model_path(self) -> str:
         return os.path.join(self.model_dir, "best_zone_detection.pt")
+
+    @property
+    def required_model_paths(self) -> dict[str, str]:
+        return {
+            "emanuskript": self.emanuskript_model_path,
+            "catmus": self.catmus_model_path,
+            "zone": self.zone_model_path,
+        }
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 
