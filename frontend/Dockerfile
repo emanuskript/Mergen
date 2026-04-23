@@ -7,8 +7,8 @@ RUN npm ci
 
 COPY . .
 
-ARG BACKEND_URL=http://backend:8000
-ENV BACKEND_URL=$BACKEND_URL
+ARG INTERNAL_BACKEND_URL=http://backend:8000
+ENV INTERNAL_BACKEND_URL=$INTERNAL_BACKEND_URL
 
 RUN npm run build
 
@@ -17,6 +17,11 @@ FROM node:20-alpine AS runner
 WORKDIR /app
 
 ENV NODE_ENV=production
+ENV HOSTNAME=0.0.0.0
+ENV PORT=3000
+
+ARG INTERNAL_BACKEND_URL=http://backend:8000
+ENV INTERNAL_BACKEND_URL=$INTERNAL_BACKEND_URL
 
 # Copy only what's needed to run
 COPY --from=builder /app/package.json ./

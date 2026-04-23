@@ -143,10 +143,12 @@ Requires=${BACKEND_SERVICE}.service
 [Service]
 Type=simple
 User=${USER}
-WorkingDirectory=${REPO_DIR}/frontend
+WorkingDirectory=${REPO_DIR}/frontend/.next/standalone
 Environment=NODE_ENV=production
 Environment=PORT=${FRONTEND_PORT}
-ExecStart=/usr/bin/env npm run start -- --hostname 127.0.0.1 --port ${FRONTEND_PORT}
+Environment=HOSTNAME=127.0.0.1
+Environment=INTERNAL_BACKEND_URL=http://127.0.0.1:${BACKEND_PORT}
+ExecStart=/usr/bin/env node server.js
 Restart=always
 RestartSec=5
 
@@ -232,6 +234,42 @@ verify_api() {
     || fail "nginx -> backend classes route is broken."
 }
 
+verify_prediction_flow() {
+  local smoke_image response task_id annotated_path
+  smoke_image="${TMP_ROOT}/smoke-test.jpg"
+
+  "$REPO_DIR/backend/.venv/bin/python" - "$smoke_image" <<'PY'
+from PIL import Image
+import sys
+
+Image.new("RGB", (96, 96), "white").save(sys.argv[1])
+PY
+
+  response="$(
+    curl -fsS -X POST \
+      -F "image=@${smoke_image}" \
+      -F "confidence=0.25" \
+      -F "iou=0.3" \
+      "http://127.0.0.1/api/predict/single"
+  )" || fail "nginx -> backend single prediction route is broken."
+
+  task_id="$(
+    printf '%s' "$response" | "$REPO_DIR/backend/.venv/bin/python" -c \
+      'import json,sys; print(json.load(sys.stdin)["task_id"])'
+  )"
+
+  annotated_path="$(
+    printf '%s' "$response" | "$REPO_DIR/backend/.venv/bin/python" -c \
+      'import json,sys; print(json.load(sys.stdin)["annotated_image_url"])'
+  )"
+
+  [ -n "$task_id" ] || fail "Prediction response did not include a task_id."
+  [ -n "$annotated_path" ] || fail "Prediction response did not include annotated_image_url."
+
+  curl -fsSI "http://127.0.0.1${annotated_path}" | grep -qi '^content-type: image/jpeg' \
+    || fail "Predicted annotated image is not reachable through nginx."
+}
+
 verify_public_route() {
   if curl -fsS "http://${PUBLIC_IP}" | grep -q "${APP_TITLE}"; then
     log "Public IP is serving the expected frontend."
@@ -292,7 +330,11 @@ if [ -f package-lock.json ]; then
 else
   TMPDIR="$TMP_ROOT" npm install --cache "$TMP_ROOT/.npm-cache"
 fi
-BACKEND_URL="http://127.0.0.1:${BACKEND_PORT}" TMPDIR="$TMP_ROOT" npm run build
+INTERNAL_BACKEND_URL="http://127.0.0.1:${BACKEND_PORT}" TMPDIR="$TMP_ROOT" npm run build
+mkdir -p .next/standalone/.next
+rm -rf .next/standalone/.next/static .next/standalone/public
+cp -R .next/static .next/standalone/.next/static
+cp -R public .next/standalone/public
 cd "$REPO_DIR"
 
 log "Writing services and nginx config..."
@@ -322,6 +364,7 @@ sudo systemctl is-active --quiet nginx || fail "nginx not active."
 verify_local_frontend
 verify_local_nginx
 verify_api
+verify_prediction_flow
 verify_public_route
 
 echo

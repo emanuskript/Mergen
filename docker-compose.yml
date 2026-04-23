@@ -21,14 +21,19 @@ services:
     build:
       context: ./frontend
       args:
-        BACKEND_URL: http://backend:8000
+        INTERNAL_BACKEND_URL: http://backend:8000
     restart: unless-stopped
+    environment:
+      - INTERNAL_BACKEND_URL=http://backend:8000
     depends_on:
       - backend
 
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    depends_on:
+      - frontend
+      - backend
     ports:
       - "80:80"
       - "443:443"

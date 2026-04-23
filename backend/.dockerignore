@@ -9,3 +9,4 @@ analytics.db
 .tasks/
 .DS_Store
 tests/
+recovered_src/

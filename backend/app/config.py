@@ -26,7 +26,7 @@ BACKEND_ROOT = _resolve_backend_root()
 
 class Settings(BaseSettings):
     # CORS
-    cors_origins: str = "http://localhost:3000"
+    cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     # Paths
     backend_root: str = str(BACKEND_ROOT)

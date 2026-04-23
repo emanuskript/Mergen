@@ -7,15 +7,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY pyproject.toml ./
+COPY app/ app/
 
 # install CPU-only torch first
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision \
  && pip install --no-cache-dir -e .
 
-COPY app/ app/
-
 ENV MODEL_DIR=/app/models
 ENV CORS_ORIGINS=*
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000
 
