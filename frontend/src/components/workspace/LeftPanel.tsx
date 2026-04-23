@@ -7,7 +7,6 @@ import { FileEntryItem } from "@/components/workspace/FileEntryItem";
 import {
   fileEntriesAtom,
   selectedFileIdAtom,
-  addFilesAtom,
   removeFileAtom,
   updateFileEntryAtom,
   idleFileCountAtom,
@@ -15,6 +14,7 @@ import {
   runFileAtom,
   anyLoadingAtom,
   selectedBatchImageIndexAtom,
+  addAndRunFilesAtom,
 } from "@/lib/atoms";
 
 const ACCEPT = ".png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp,.zip";
@@ -23,7 +23,7 @@ export function LeftPanel() {
   const entries = useAtomValue(fileEntriesAtom);
   const [selectedId, setSelectedId] = useAtom(selectedFileIdAtom);
   const [expandedId, setExpandedId] = useAtom(expandedFileIdAtom);
-  const addFiles = useSetAtom(addFilesAtom);
+  const addAndRunFiles = useSetAtom(addAndRunFilesAtom);
   const removeFile = useSetAtom(removeFileAtom);
   const updateEntry = useSetAtom(updateFileEntryAtom);
   const runFile = useSetAtom(runFileAtom);
@@ -36,7 +36,7 @@ export function LeftPanel() {
 
   const handleFilesSelected = (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return;
-    addFiles(Array.from(fileList));
+    void addAndRunFiles(Array.from(fileList));
   };
 
   return (

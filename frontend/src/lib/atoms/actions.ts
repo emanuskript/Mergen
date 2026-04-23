@@ -6,6 +6,7 @@ import {
   fileEntriesAtom,
   updateFileEntryAtom,
   resetAllFilesAtom,
+  addFilesAtom,
 } from "./files";
 import {
   classesAtom,
@@ -156,6 +157,14 @@ export const runFileAtom = atom(null, async (get, set, fileId: string) => {
       });
     }
   }
+});
+
+// ── Add new files and start them immediately ──
+export const addAndRunFilesAtom = atom(null, async (_get, set, files: File[]) => {
+  const newIds = set(addFilesAtom, files) as string[] | undefined;
+  if (!newIds?.length) return;
+
+  await Promise.allSettled(newIds.map((id) => set(runFileAtom, id)));
 });
 
 // ── Run all idle/error files ──

@@ -60,10 +60,11 @@ export const addFilesAtom = atom(null, (get, set, files: File[]) => {
   });
   const current = get(fileEntriesAtom);
   set(fileEntriesAtom, [...current, ...newEntries]);
-  // Auto-select the first added file if nothing is selected
-  if (!get(selectedFileIdAtom) && newEntries.length > 0) {
+  // Newly added files should become the active selection.
+  if (newEntries.length > 0) {
     set(selectedFileIdAtom, newEntries[0].id);
   }
+  return newEntries.map((entry) => entry.id);
 });
 
 // ── Write atom: remove a file ──

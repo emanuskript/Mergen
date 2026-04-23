@@ -12,7 +12,7 @@ import { COCOJson } from "@/lib/types/coco";
 import {
   selectedFileAtom,
   fileCountAtom,
-  addFilesAtom,
+  addAndRunFilesAtom,
   colorMapAtom,
   selectedClassNamesAtom,
   inspectedAnnotationAtom,
@@ -39,7 +39,7 @@ function extractImageCoco(merged: COCOJson, filename: string): COCOJson | null {
 export function CenterCanvas() {
   const selectedFile = useAtomValue(selectedFileAtom);
   const fileCount = useAtomValue(fileCountAtom);
-  const addFiles = useSetAtom(addFilesAtom);
+  const addAndRunFiles = useSetAtom(addAndRunFilesAtom);
   const colorMap = useAtomValue(colorMapAtom);
   const selectedClasses = useAtomValue(selectedClassNamesAtom);
   const inspectedAnnotation = useAtomValue(inspectedAnnotationAtom);
@@ -69,7 +69,7 @@ export function CenterCanvas() {
         <div data-tour="file-upload" className="w-full max-w-md px-8">
           <FileUploader
             file={null}
-            onFileChange={(f) => { if (f) addFiles([f]); }}
+            onFileChange={(f) => { if (f) void addAndRunFiles([f]); }}
           />
         </div>
       </div>
