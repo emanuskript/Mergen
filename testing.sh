@@ -20,6 +20,11 @@ NGINX_LINK="/etc/nginx/sites-enabled/${SITE_NAME}"
 DOMAIN="${DOMAIN:-}"
 CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
 
+# Optional explicit public host override:
+#   PUBLIC_HOST=203.0.113.10
+#   PUBLIC_HOST=apps.example.org
+PUBLIC_HOST="${PUBLIC_HOST:-}"
+
 # Optional smoke test image:
 #   TEST_IMAGE=/absolute/path/to/test.jpg
 TEST_IMAGE="${TEST_IMAGE:-}"
@@ -44,19 +49,10 @@ else
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PUBLIC_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-FQDN="$(hostname -f 2>/dev/null || true)"
 
-BEST_HTTP_LINK=""
-if [[ -n "${DOMAIN}" ]]; then
-  BEST_HTTP_LINK="http://${DOMAIN}/"
-elif [[ -n "${FQDN}" && "${FQDN}" != "localhost" && "${FQDN}" != "(none)" ]]; then
-  BEST_HTTP_LINK="http://${FQDN}/"
-elif [[ -n "${PUBLIC_IP}" ]]; then
-  BEST_HTTP_LINK="http://${PUBLIC_IP}/"
-else
-  BEST_HTTP_LINK="http://127.0.0.1/"
-fi
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 1; }
+}
 
 curl_code() {
   local url="$1"
@@ -76,9 +72,58 @@ check_url() {
   fi
 }
 
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || { err "Missing command: $1"; exit 1; }
+is_ipv4() {
+  local ip="$1"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
 }
+
+is_private_ipv4() {
+  local ip="$1"
+  [[ "$ip" =~ ^10\. ]] \
+    || [[ "$ip" =~ ^127\. ]] \
+    || [[ "$ip" =~ ^192\.168\. ]] \
+    || [[ "$ip" =~ ^169\.254\. ]] \
+    || [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]]
+}
+
+get_public_ip() {
+  local candidate=""
+  local services=(
+    "https://api.ipify.org"
+    "https://checkip.amazonaws.com"
+    "https://ifconfig.me/ip"
+    "https://icanhazip.com"
+  )
+
+  for url in "${services[@]}"; do
+    candidate="$(curl -4 -fsS --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ -n "$candidate" ]] && is_ipv4 "$candidate" && ! is_private_ipv4 "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+LOCAL_INTERFACE_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+PUBLIC_IP="$(get_public_ip || true)"
+
+BEST_HTTP_LINK=""
+PUBLIC_CANDIDATE_LINK=""
+
+if [[ -n "${DOMAIN}" ]]; then
+  BEST_HTTP_LINK="http://${DOMAIN}/"
+  PUBLIC_CANDIDATE_LINK="${BEST_HTTP_LINK}"
+elif [[ -n "${PUBLIC_HOST}" ]]; then
+  BEST_HTTP_LINK="http://${PUBLIC_HOST}/"
+  PUBLIC_CANDIDATE_LINK="${BEST_HTTP_LINK}"
+elif [[ -n "${PUBLIC_IP}" ]]; then
+  BEST_HTTP_LINK="http://${PUBLIC_IP}/"
+  PUBLIC_CANDIDATE_LINK="${BEST_HTTP_LINK}"
+else
+  BEST_HTTP_LINK="http://127.0.0.1/"
+fi
 
 ############################################
 # Preflight
@@ -86,6 +131,12 @@ require_cmd() {
 require_cmd curl
 require_cmd python3
 require_cmd nginx
+
+log "Detected addressing"
+echo "Local interface IP: ${LOCAL_INTERFACE_IP:-<unknown>}"
+echo "Public IP:          ${PUBLIC_IP:-<unknown>}"
+echo "Public host:        ${PUBLIC_HOST:-<unset>}"
+echo "Domain:             ${DOMAIN:-<unset>}"
 
 log "Checking local upstreams first"
 
@@ -112,6 +163,10 @@ log "Writing clean nginx config"
 SERVER_NAME="_"
 if [[ -n "${DOMAIN}" ]]; then
   SERVER_NAME="${DOMAIN}"
+elif [[ -n "${PUBLIC_HOST}" ]]; then
+  SERVER_NAME="${PUBLIC_HOST}"
+elif [[ -n "${PUBLIC_IP}" ]]; then
+  SERVER_NAME="${PUBLIC_IP}"
 fi
 
 BACKUP_SUFFIX="$(date +%Y%m%d_%H%M%S)"
@@ -133,7 +188,6 @@ server {
     proxy_read_timeout 3600s;
     send_timeout 3600s;
 
-    # Backend docs / schema
     location = /openapi.json {
         proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT}/openapi.json;
         proxy_http_version 1.1;
@@ -161,12 +215,10 @@ server {
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
 
-    # API
     location /api/ {
         proxy_pass http://${BACKEND_HOST}:${BACKEND_PORT};
         proxy_http_version 1.1;
 
-        # Important for large single/batch uploads
         proxy_request_buffering off;
         proxy_buffering off;
         proxy_max_temp_file_size 0;
@@ -179,7 +231,6 @@ server {
         proxy_set_header Connection "upgrade";
     }
 
-    # Frontend
     location / {
         proxy_pass http://${FRONTEND_HOST}:${FRONTEND_PORT};
         proxy_http_version 1.1;
@@ -376,7 +427,6 @@ fi
 ############################################
 BEST_FINAL_LINK="${BEST_HTTP_LINK}"
 if [[ -n "${DOMAIN}" ]]; then
-  # If HTTPS was configured successfully, this should work:
   HTTPS_CODE="$(curl -k -sS -o /dev/null -w "%{http_code}" "https://${DOMAIN}/" || true)"
   if [[ "${HTTPS_CODE}" =~ ^2|3 ]]; then
     BEST_FINAL_LINK="https://${DOMAIN}/"
@@ -385,14 +435,27 @@ fi
 
 echo
 ok "testing completed"
-echo "Frontend local:    http://${FRONTEND_HOST}:${FRONTEND_PORT}/"
-echo "Backend local:     http://${BACKEND_HOST}:${BACKEND_PORT}/"
-echo "Nginx local:       http://127.0.0.1/"
-echo "Best final link:   ${BEST_FINAL_LINK}"
+echo "Frontend local:      http://${FRONTEND_HOST}:${FRONTEND_PORT}/"
+echo "Backend local:       http://${BACKEND_HOST}:${BACKEND_PORT}/"
+echo "Nginx local:         http://127.0.0.1/"
+echo "Local interface IP:  ${LOCAL_INTERFACE_IP:-<unknown>}"
+echo "Public IP:           ${PUBLIC_IP:-<unknown>}"
+echo "Public candidate:    ${PUBLIC_CANDIDATE_LINK:-<none>}"
+echo "Best final link:     ${BEST_FINAL_LINK}"
 
 FINAL_CODE="$(curl -sS -o /dev/null -w "%{http_code}" "${BEST_FINAL_LINK}" || true)"
 if [[ "${FINAL_CODE}" =~ ^2|3 ]]; then
-  ok "Final link responds locally: ${BEST_FINAL_LINK} (HTTP ${FINAL_CODE})"
+  ok "Final link responds from this VM: ${BEST_FINAL_LINK} (HTTP ${FINAL_CODE})"
 else
   warn "Final link did not respond from this VM: ${BEST_FINAL_LINK} (HTTP ${FINAL_CODE})"
+fi
+
+if [[ -n "${PUBLIC_CANDIDATE_LINK}" ]]; then
+  echo
+  echo "Public URL to test from another machine:"
+  echo "  ${PUBLIC_CANDIDATE_LINK}"
+else
+  echo
+  warn "No public URL could be determined automatically."
+  warn "Set PUBLIC_HOST=your.public.ip.or.hostname or DOMAIN=your.domain"
 fi
