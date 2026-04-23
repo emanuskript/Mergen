@@ -143,6 +143,11 @@ chmod +x deploy.sh
 ```
 
 The script expects model weights in backend/models before deployment.
+It also defaults the backend inference pool to a single worker on direct host deployments to keep low-memory CPU VMs stable. You can override that when needed, for example:
+
+```bash
+BACKEND_MAX_POOL_WORKERS=2 ./deploy.sh
+```
 
 ## Important configuration
 
@@ -157,7 +162,8 @@ Backend environment variables:
 
 Frontend build/runtime:
 
-- BACKEND_URL (used by Next.js rewrite from /api/* to backend)
+- INTERNAL_BACKEND_URL (used by the standalone frontend runtime when /api/* is not already proxied at the public edge)
+- BACKEND_URL (legacy fallback supported by next.config.ts)
 
 ## Analytics authentication
 

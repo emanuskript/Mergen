@@ -12,6 +12,7 @@ FRONTEND_SERVICE="layout-frontend"
 NGINX_CONF="/etc/nginx/sites-available/layout-host"
 BACKEND_PORT="8000"
 FRONTEND_PORT="3000"
+BACKEND_MAX_POOL_WORKERS="${BACKEND_MAX_POOL_WORKERS:-1}"
 TMP_ROOT=""
 PUBLIC_IP=""
 APP_TITLE="Manuscript Layout Analysis"
@@ -23,6 +24,12 @@ trap cleanup EXIT
 
 log() { echo "==> $*"; }
 fail() { echo; echo "!! $*"; exit 1; }
+
+dump_backend_logs() {
+  echo
+  echo "-- ${BACKEND_SERVICE} journal (last 80 lines) --"
+  sudo journalctl -u "${BACKEND_SERVICE}" -n 80 --no-pager || true
+}
 
 detect_repo_dir() {
   if [ -d "$SCRIPT_DIR/.git" ] && [ -d "$SCRIPT_DIR/backend" ] && [ -d "$SCRIPT_DIR/frontend" ]; then
@@ -123,6 +130,11 @@ User=${USER}
 WorkingDirectory=${REPO_DIR}/backend
 Environment=MODEL_DIR=${REPO_DIR}/backend/models
 Environment=CORS_ORIGINS=http://${PUBLIC_IP}
+Environment=MAX_POOL_WORKERS=${BACKEND_MAX_POOL_WORKERS}
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=NUMEXPR_NUM_THREADS=1
 Environment=PYTHONUNBUFFERED=1
 ExecStart=${REPO_DIR}/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port ${BACKEND_PORT} --workers 1
 Restart=always
@@ -234,24 +246,52 @@ verify_api() {
     || fail "nginx -> backend classes route is broken."
 }
 
+run_prediction_request() {
+  local url="$1"
+  local response_file="$2"
+
+  curl -sS -o "${response_file}" -w "%{http_code}" -X POST \
+    -F "image=@${smoke_image}" \
+    -F "confidence=0.25" \
+    -F "iou=0.3" \
+    "${url}"
+}
+
 verify_prediction_flow() {
-  local smoke_image response task_id annotated_path
+  local smoke_image response response_file backend_response_file http_code backend_http_code task_id annotated_path
   smoke_image="${TMP_ROOT}/smoke-test.jpg"
+  response_file="${TMP_ROOT}/predict-response.json"
+  backend_response_file="${TMP_ROOT}/predict-response-backend.json"
 
   "$REPO_DIR/backend/.venv/bin/python" - "$smoke_image" <<'PY'
 from PIL import Image
 import sys
 
-Image.new("RGB", (96, 96), "white").save(sys.argv[1])
+Image.new("RGB", (512, 512), "white").save(sys.argv[1])
 PY
 
-  response="$(
-    curl -fsS -X POST \
-      -F "image=@${smoke_image}" \
-      -F "confidence=0.25" \
-      -F "iou=0.3" \
-      "http://127.0.0.1/api/predict/single"
-  )" || fail "nginx -> backend single prediction route is broken."
+  http_code="$(run_prediction_request "http://127.0.0.1/api/predict/single" "${response_file}")" || {
+    dump_backend_logs
+    fail "nginx -> backend single prediction route is broken."
+  }
+
+  if [ "${http_code}" != "200" ]; then
+    echo
+    echo "-- nginx predict response body --"
+    cat "${response_file}" || true
+
+    backend_http_code="$(run_prediction_request "http://127.0.0.1:${BACKEND_PORT}/api/predict/single" "${backend_response_file}")" || true
+    if [ -n "${backend_http_code:-}" ]; then
+      echo
+      echo "-- backend direct predict response (${backend_http_code}) --"
+      cat "${backend_response_file}" || true
+    fi
+
+    dump_backend_logs
+    fail "nginx -> backend single prediction route returned HTTP ${http_code}."
+  fi
+
+  response="$(cat "${response_file}")"
 
   task_id="$(
     printf '%s' "$response" | "$REPO_DIR/backend/.venv/bin/python" -c \
@@ -266,7 +306,7 @@ PY
   [ -n "$task_id" ] || fail "Prediction response did not include a task_id."
   [ -n "$annotated_path" ] || fail "Prediction response did not include annotated_image_url."
 
-  curl -fsSI "http://127.0.0.1${annotated_path}" | grep -qi '^content-type: image/jpeg' \
+  curl -fsS "http://127.0.0.1${annotated_path}" -o /dev/null -D - | grep -qi '^content-type: image/jpeg' \
     || fail "Predicted annotated image is not reachable through nginx."
 }
 
@@ -283,7 +323,8 @@ log "Installing base packages..."
 sudo apt-get update -y
 sudo apt-get install -y --no-install-recommends \
   ca-certificates curl git nginx python3 python3-pip python3-venv \
-  build-essential libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
+  build-essential libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
+  libspatialindex-dev
 
 log "Resolving repository path..."
 REPO_DIR="$(detect_repo_dir)"
