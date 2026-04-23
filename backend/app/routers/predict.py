@@ -33,22 +33,52 @@ def _parse_selected_classes(classes: Optional[str]) -> list[str]:
     if classes is None or classes.strip() == "":
         return FINAL_CLASSES
 
+    raw_classes = classes.strip()
+
+    # Swagger UI uses "string" as the default placeholder for optional string
+    # fields. Treat that placeholder as "no class filter" instead of failing.
+    if raw_classes == "string":
+        return FINAL_CLASSES
+
     try:
-        parsed = json.loads(classes)
+        parsed = json.loads(raw_classes)
     except JSONDecodeError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail="Invalid classes payload. Expected a JSON array of class names.",
-        ) from exc
+        parsed = [name.strip() for name in raw_classes.split(",") if name.strip()]
+        if not parsed:
+            return FINAL_CLASSES
+
+    if isinstance(parsed, str):
+        parsed = [parsed.strip()] if parsed.strip() else FINAL_CLASSES
 
     if not isinstance(parsed, list):
-        raise HTTPException(status_code=422, detail="Classes must be provided as a JSON array.")
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Invalid classes payload. Use a JSON array like "
+                '["Border", "Gloss"] or a comma-separated list.'
+            ),
+        )
     if not all(isinstance(name, str) for name in parsed):
         raise HTTPException(status_code=422, detail="Each class entry must be a string.")
     if not parsed:
         raise HTTPException(status_code=422, detail="Please select at least one class.")
 
-    return parsed
+    normalized = [name.strip() for name in parsed if name.strip()]
+    if not normalized:
+        return FINAL_CLASSES
+
+    invalid = [name for name in normalized if name not in FINAL_CLASSES]
+    if invalid:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Unknown class name(s): "
+                + ", ".join(invalid)
+                + ". Use the /api/classes endpoint for the supported list."
+            ),
+        )
+
+    return normalized
 
 
 def _validate_thresholds(confidence: float, iou: float) -> None:
@@ -73,7 +103,10 @@ async def predict_single(
     image: UploadFile = File(...),
     confidence: float = Form(0.25),
     iou: float = Form(0.3),
-    classes: Optional[str] = Form(None),
+    classes: Optional[str] = Form(
+        None,
+        description='Optional class filter. Use JSON like ["Border","Gloss"] or a comma-separated list.',
+    ),
 ):
     """Run 3 YOLO models on a single image and return combined COCO JSON."""
     selected_classes = _parse_selected_classes(classes)
@@ -253,7 +286,10 @@ async def predict_batch(
     zip_file: UploadFile = File(...),
     confidence: float = Form(0.25),
     iou: float = Form(0.3),
-    classes: Optional[str] = Form(None),
+    classes: Optional[str] = Form(
+        None,
+        description='Optional class filter. Use JSON like ["Border","Gloss"] or a comma-separated list.',
+    ),
 ):
     """Start batch processing of a ZIP archive."""
     selected_classes = _parse_selected_classes(classes)
