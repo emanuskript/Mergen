@@ -21,7 +21,7 @@ Mergen is a full-stack manuscript layout analysis app that runs three YOLO model
 
 ## Model weights
 
-Download all required model weights from OwnCloud:
+The deployment script can download the required model weights directly from OwnCloud:
 
 https://owncloud.gwdg.de/index.php/s/PyQ2nN6aKpypKfG?path=%2FApps%2FLayout%20App%2Fmodel%20weights
 
@@ -31,7 +31,8 @@ Place these files in backend/models:
 - best_catmus.pt
 - best_zone_detection.pt
 
-If deployment fails with `PytorchStreamReader failed reading zip archive`, the copied checkpoint on the VM is corrupted or incomplete. Re-copy the affected `.pt` file into `backend/models` and redeploy.
+If you are deploying with `./deploy.sh`, it will download these weights automatically into `backend/models` and re-download them if validation detects corruption.
+If deployment still fails with `PytorchStreamReader failed reading zip archive`, the checkpoint download or local file is still corrupted and should be fetched again.
 
 ## Supported classes
 
@@ -144,8 +145,7 @@ chmod +x deploy.sh
 ./deploy.sh
 ```
 
-The script expects model weights in backend/models before deployment.
-It also defaults the backend inference pool to a single worker on direct host deployments to keep low-memory CPU VMs stable. You can override that when needed, for example:
+The script defaults the backend inference pool to a single worker on direct host deployments to keep low-memory CPU VMs stable. You can override that when needed, for example:
 
 ```bash
 BACKEND_MAX_POOL_WORKERS=2 ./deploy.sh

@@ -13,6 +13,7 @@ NGINX_CONF="/etc/nginx/sites-available/layout-host"
 BACKEND_PORT="8000"
 FRONTEND_PORT="3000"
 BACKEND_MAX_POOL_WORKERS="${BACKEND_MAX_POOL_WORKERS:-1}"
+MODEL_SHARE_BASE_URL="https://owncloud.gwdg.de/remote.php/dav/public-files/PyQ2nN6aKpypKfG/Apps/Layout%20App/model%20weights"
 TMP_ROOT=""
 PUBLIC_IP=""
 APP_TITLE="Manuscript Layout Analysis"
@@ -71,6 +72,37 @@ check_weights() {
   [ -f "$REPO_DIR/backend/models/best_catmus.pt" ] &&
   [ -f "$REPO_DIR/backend/models/best_emanuskript_segmentation.pt" ] &&
   [ -f "$REPO_DIR/backend/models/best_zone_detection.pt" ]
+}
+
+download_model_weight() {
+  local filename="$1"
+  local target_dir="$2"
+  local tmp_file="${target_dir}/${filename}.tmp"
+  local final_file="${target_dir}/${filename}"
+
+  curl -fL --retry 3 --retry-delay 2 \
+    "${MODEL_SHARE_BASE_URL}/${filename}" \
+    -o "${tmp_file}"
+  mv "${tmp_file}" "${final_file}"
+}
+
+download_all_model_weights() {
+  local target_dir="$1"
+  mkdir -p "${target_dir}"
+
+  log "Downloading model weights from OwnCloud share..."
+  download_model_weight "best_catmus.pt" "${target_dir}"
+  download_model_weight "best_emanuskript_segmentation.pt" "${target_dir}"
+  download_model_weight "best_zone_detection.pt" "${target_dir}"
+}
+
+ensure_model_weights() {
+  local target_dir="${REPO_DIR}/backend/models"
+  mkdir -p "${target_dir}"
+
+  if ! check_weights; then
+    download_all_model_weights "${target_dir}"
+  fi
 }
 
 free_space() {
@@ -336,8 +368,8 @@ cd "$REPO_DIR"
 
 ensure_node_20
 
-log "Checking model weights..."
-check_weights || fail "Missing model weights in backend/models."
+log "Ensuring model weights are present..."
+ensure_model_weights
 
 PUBLIC_IP="$(detect_public_ip)"
 [ -n "$PUBLIC_IP" ] || fail "Unable to detect public IP."
@@ -366,7 +398,13 @@ TMPDIR="$TMP_ROOT" "$REPO_DIR/backend/.venv/bin/pip" install --no-cache-dir \
 log "Validating backend model checkpoints..."
 MODEL_DIR="${REPO_DIR}/backend/models" \
   "$REPO_DIR/backend/.venv/bin/python" -m app.scripts.validate_models \
-  || fail "One or more model checkpoints are invalid. Re-copy the affected .pt file(s) into backend/models and rerun deploy.sh."
+  || {
+    log "Model validation failed; re-downloading all weights from OwnCloud share..."
+    download_all_model_weights "${REPO_DIR}/backend/models"
+    MODEL_DIR="${REPO_DIR}/backend/models" \
+      "$REPO_DIR/backend/.venv/bin/python" -m app.scripts.validate_models \
+      || fail "One or more model checkpoints are invalid even after re-download."
+  }
 
 log "Building frontend..."
 cd "$REPO_DIR/frontend"
