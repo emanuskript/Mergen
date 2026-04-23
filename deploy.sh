@@ -363,6 +363,11 @@ TMPDIR="$TMP_ROOT" "$REPO_DIR/backend/.venv/bin/pip" install --no-cache-dir \
 TMPDIR="$TMP_ROOT" "$REPO_DIR/backend/.venv/bin/pip" install --no-cache-dir \
   -e "$REPO_DIR/backend"
 
+log "Validating backend model checkpoints..."
+MODEL_DIR="${REPO_DIR}/backend/models" \
+  "$REPO_DIR/backend/.venv/bin/python" -m app.scripts.validate_models \
+  || fail "One or more model checkpoints are invalid. Re-copy the affected .pt file(s) into backend/models and rerun deploy.sh."
+
 log "Building frontend..."
 cd "$REPO_DIR/frontend"
 rm -rf .next node_modules

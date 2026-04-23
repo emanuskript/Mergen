@@ -31,6 +31,8 @@ Place these files in backend/models:
 - best_catmus.pt
 - best_zone_detection.pt
 
+If deployment fails with `PytorchStreamReader failed reading zip archive`, the copied checkpoint on the VM is corrupted or incomplete. Re-copy the affected `.pt` file into `backend/models` and redeploy.
+
 ## Supported classes
 
 The backend exposes 22 final COCO classes, including:

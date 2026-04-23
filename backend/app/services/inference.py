@@ -33,7 +33,13 @@ def _run_single_model(args: tuple) -> tuple[str, str]:
     if model_name not in _worker_models:
         from ultralytics import YOLO
 
-        _worker_models[model_name] = YOLO(model_path)
+        try:
+            _worker_models[model_name] = YOLO(model_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load model checkpoint at {model_path}. "
+                "The file may be corrupted or incomplete; re-copy the .pt file to the VM."
+            ) from exc
 
     model = _worker_models[model_name]
 
