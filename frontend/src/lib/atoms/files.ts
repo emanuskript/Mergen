@@ -1,5 +1,6 @@
 import { atom } from "jotai";
 import { FileEntry, FileEntryKind } from "./types";
+import { createClientId } from "../utils/clientId";
 
 // ── Default detection settings (for new files) ──
 export const defaultConfidenceAtom = atom(0.25);
@@ -43,7 +44,7 @@ export const addFilesAtom = atom(null, (get, set, files: File[]) => {
   const newEntries: FileEntry[] = files.map((file) => {
     const kind: FileEntryKind = isZip(file) ? "zip" : "image";
     return {
-      id: crypto.randomUUID(),
+      id: createClientId(),
       file,
       kind,
       thumbnailUrl: kind === "image" ? URL.createObjectURL(file) : null,
