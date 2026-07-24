@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use Mergen, please cite the software using the metadata in this file."
+type: software
+title: "Mergen: Manuscript Layout Analysis"
+abstract: >-
+  Mergen is a full-stack manuscript layout analysis application that runs
+  three YOLO models in parallel, combines their results into unified
+  annotations, and provides interactive review and export tools.
+authors:
+  - given-names: Mohamed
+    family-names: Basuony
+    affiliation: Georg-August-Universität Göttingen
+    orcid: "https://orcid.org/0009-0004-7819-0622"
+  - name: Alternative Bold Solutions UG
+  - given-names: Hasan
+    family-names: Aldhahi
+    affiliation: Georg-August-Universität Göttingen
+version: 1.0.0
+date-released: "2026-07-24"
+license: Apache-2.0
+repository-code: "https://github.com/emanuskript/Mergen"
+url: "https://github.com/emanuskript/Mergen"
+keywords:
+  - manuscript studies
+  - digital humanities
+  - layout analysis
+  - computer vision
+  - YOLO
