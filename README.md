@@ -23,7 +23,7 @@ Mergen is a full-stack manuscript layout analysis app that runs three YOLO model
 
 The deployment script can download the required model weights directly from OwnCloud:
 
-https://owncloud.gwdg.de/index.php/s/PyQ2nN6aKpypKfG?path=%2FApps%2FLayout%20App%2Fmodel%20weights
+https://owncloud.gwdg.de/index.php/apps/files/?dir=/Mergen%20Weights&fileid=4279218283
 
 Place these files in backend/models:
 
