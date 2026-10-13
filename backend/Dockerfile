@@ -1,5 +1,14 @@
 FROM python:3.11-slim
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    MODEL_DIR=/app/models \
+    TASK_BASE_DIR=/app/data/tasks \
+    ANALYTICS_DB_PATH=/app/data/analytics.db \
+    XDG_CONFIG_HOME=/app/data/.config \
+    MPLCONFIGDIR=/app/data/.cache/matplotlib
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 libspatialindex-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -11,11 +20,13 @@ COPY app/ app/
 
 # install CPU-only torch first
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision \
- && pip install --no-cache-dir -e .
+ && pip install --no-cache-dir -e . \
+ && groupadd --system app \
+ && useradd --system --gid app --home-dir /app --shell /usr/sbin/nologin app \
+ && mkdir -p /app/data/tasks /app/data/.config /app/data/.cache/matplotlib \
+ && chown -R app:app /app/data
 
-ENV MODEL_DIR=/app/models
-ENV CORS_ORIGINS=*
-ENV PYTHONUNBUFFERED=1
+USER app
 
 EXPOSE 8000
 

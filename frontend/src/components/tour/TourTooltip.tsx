@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState, useMemo } from "react";
+import { createElement, useEffect, useRef, useState } from "react";
 import { useAtomValue } from "jotai";
 import * as LucideIcons from "lucide-react";
 import { tourStepIndexAtom, tourTotalStepsAtom } from "@/lib/atoms";
@@ -50,7 +50,7 @@ export function TourTooltip({ step, targetRect }: TourTooltipProps) {
   const [position, setPosition] = useState({ top: 0, left: 0 });
   const [arrow, setArrow] = useState<ArrowDirection>("none");
 
-  const Icon = useMemo(() => getIcon(step.icon), [step.icon]);
+  const icon = getIcon(step.icon);
 
   useEffect(() => {
     const tooltip = tooltipRef.current;
@@ -64,7 +64,7 @@ export function TourTooltip({ step, targetRect }: TourTooltipProps) {
       const pad = 16;
       const offset = 12;
 
-      let placement = step.placement;
+      const placement = step.placement;
 
       // Center in viewport for steps without target
       if (!targetRect || placement === "center") {
@@ -160,9 +160,9 @@ export function TourTooltip({ step, targetRect }: TourTooltipProps) {
 
       {/* Header */}
       <div className="flex items-center gap-2 px-4 pt-4 pb-2">
-        {Icon && (
+        {icon && (
           <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
-            <Icon className="h-5 w-5" />
+            {createElement(icon, { className: "h-5 w-5" })}
           </div>
         )}
         <h3 className="flex-1 text-base font-semibold text-foreground">

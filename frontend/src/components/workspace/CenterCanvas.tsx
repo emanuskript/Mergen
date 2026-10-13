@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import Image from "next/image";
 import { useAtom, useAtomValue, useSetAtom } from "jotai";
 
 import { FileUploader } from "@/components/analysis/FileUploader";
@@ -53,13 +52,23 @@ export function CenterCanvas() {
 
   const [imageSrc, setImageSrc] = useState("");
   useEffect(() => {
+    let active = true;
     if (selectedFile?.kind !== "image") {
-      setImageSrc("");
-      return;
+      queueMicrotask(() => {
+        if (active) setImageSrc("");
+      });
+      return () => {
+        active = false;
+      };
     }
     const url = URL.createObjectURL(selectedFile.file);
-    setImageSrc(url);
-    return () => URL.revokeObjectURL(url);
+    queueMicrotask(() => {
+      if (active) setImageSrc(url);
+    });
+    return () => {
+      active = false;
+      URL.revokeObjectURL(url);
+    };
   }, [selectedFile?.file, selectedFile?.kind]);
 
   // ── No files at all: center drop zone ──

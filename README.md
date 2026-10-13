@@ -21,7 +21,7 @@ Mergen is a full-stack manuscript layout analysis app that runs three YOLO model
 
 ## Model weights
 
-The deployment script can download the required model weights directly from OwnCloud:
+The project publishes the required model weights from this OwnCloud folder:
 
 https://owncloud.gwdg.de/index.php/apps/files/?dir=/Mergen%20Weights&fileid=4279218283
 
@@ -31,8 +31,12 @@ Place these files in backend/models:
 - best_catmus.pt
 - best_zone_detection.pt
 
-If you are deploying with `./deploy.sh`, it will download these weights automatically into `backend/models` and re-download them if validation detects corruption.
-If deployment still fails with `PytorchStreamReader failed reading zip archive`, the checkpoint download or local file is still corrupted and should be fetched again.
+The folder page is not a stable direct-download endpoint, so deployments do not
+scrape it or embed credentials. Download the three files manually and copy them
+to `backend/models/`. An operator may instead supply an authenticated direct
+download base through `MODEL_WEIGHTS_BASE_URL`; the URL must expose each exact
+filename at its root. The deployment validates the checkpoints before starting
+the service and never silently overwrites an invalid operator-supplied file.
 
 ## Supported classes
 
@@ -111,21 +115,20 @@ Frontend URL: http://localhost:3000/analyze
 
 ## Deployment
 
-You can deploy with either Docker Compose (recommended) or direct host deployment script.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for server sizing, exact commands, secret and
+model provisioning, persistence, TLS, backup, rollback, and verification.
 
 ### Option A: Docker Compose + Caddy
 
-1. Ensure backend/model files are present.
-2. Optionally set environment values:
-   - SITE_ADDRESS (for Caddy, default :80)
-   - JWT_SECRET
-   - ANALYTICS_USERNAME
-   - ANALYTICS_PASSWORD
+1. Put all three validated model files in `backend/models/`.
+2. Copy `.env.example` to `.env`, set the public origin/domain, and replace all
+   secret placeholders.
 
 Run:
 
 ```bash
-docker compose up -d --build
+docker compose --env-file .env config
+docker compose --env-file .env up -d --build
 ```
 
 This starts:
@@ -138,10 +141,11 @@ This starts:
 
 The repository includes deploy.sh, which installs dependencies, builds frontend, provisions systemd services, and configures nginx.
 
-Run from project root:
+Run from a clean project checkout on Ubuntu 22.04/24.04:
 
 ```bash
-chmod +x deploy.sh
+APP_HOST=mergen.example.org \
+PUBLIC_URL=https://mergen.example.org \
 ./deploy.sh
 ```
 
@@ -155,9 +159,13 @@ BACKEND_MAX_POOL_WORKERS=2 ./deploy.sh
 
 Backend environment variables:
 
-- MODEL_DIR (defaults to backend/models)
-- CORS_ORIGINS (comma-separated, default http://localhost:3000)
+- `APP_ENV` (`production` enables rejection of repository credentials)
+- `MODEL_DIR` (defaults to `backend/models`)
+- `TASK_BASE_DIR` and `ANALYTICS_DB_PATH` (must be persistent and writable)
+- `CORS_ORIGINS` (comma-separated exact origins)
 - MAX_POOL_WORKERS (default 3)
+- `MAX_UPLOAD_BYTES`, `MAX_BATCH_ENTRIES`, and `MAX_BATCH_UNCOMPRESSED_BYTES`
+- `TASK_TTL_MINUTES` and `TASK_CLEANUP_INTERVAL_SECONDS`
 - JWT_SECRET
 - ANALYTICS_USERNAME
 - ANALYTICS_PASSWORD
@@ -169,7 +177,9 @@ Frontend build/runtime:
 
 ## Analytics authentication
 
-Default credentials are configured in backend/app/config.py and should be changed in production:
+Development defaults exist for local use only. With `APP_ENV=production`, the
+backend refuses to start with the repository JWT secret or analytics password.
+Generate unique production values; do not reuse these local defaults:
 
 - username: admin
 - password: layout2024

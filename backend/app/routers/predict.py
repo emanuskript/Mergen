@@ -4,9 +4,12 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import stat
 import tempfile
 import zipfile
 from json import JSONDecodeError
+from pathlib import PurePosixPath
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
@@ -18,6 +21,7 @@ from app.core.model_runner import combine_and_filter_predictions
 from app.services.coco_utils import filter_coco_by_classes, merge_coco_list, stats_from_coco
 from app.services.file_manager import TaskState, create_task, get_task, get_task_dir
 from app.services.inference import run_models_parallel
+from app.config import settings
 from app.services.visualization import draw_coco_on_image
 
 logger = logging.getLogger(__name__)
@@ -27,6 +31,77 @@ router = APIRouter(tags=["predict"])
 # Valid image extensions for batch processing
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".gif"}
 SKIP_PATTERNS = ["._", ".DS_Store", "Thumbs.db", "desktop.ini", "~$"]
+
+
+async def _save_upload_with_limit(upload: UploadFile, destination: str) -> None:
+    """Stream an upload to disk without buffering an unbounded body in RAM."""
+    total = 0
+    try:
+        with open(destination, "wb") as output:
+            while chunk := await upload.read(1024 * 1024):
+                total += len(chunk)
+                if total > settings.max_upload_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Upload exceeds the {settings.max_upload_bytes}-byte limit.",
+                    )
+                output.write(chunk)
+    except Exception:
+        try:
+            os.remove(destination)
+        except OSError:
+            pass
+        raise
+
+    if total == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+
+def _safe_extract_zip(zip_path: str, destination: str) -> None:
+    """Extract a bounded ZIP while rejecting traversal and link entries."""
+    destination_root = os.path.realpath(destination)
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        entries = archive.infolist()
+        if len(entries) > settings.max_batch_entries:
+            raise ValueError(
+                f"ZIP contains more than {settings.max_batch_entries} entries."
+            )
+
+        total_uncompressed = 0
+        validated = []
+        for info in entries:
+            normalized_name = info.filename.replace("\\", "/")
+            relative = PurePosixPath(normalized_name)
+            if (
+                not normalized_name
+                or relative.is_absolute()
+                or ".." in relative.parts
+                or relative == PurePosixPath(".")
+            ):
+                raise ValueError(f"Unsafe ZIP entry: {info.filename}")
+
+            mode = (info.external_attr >> 16) & 0o170000
+            if stat.S_ISLNK(mode):
+                raise ValueError(f"ZIP links are not supported: {info.filename}")
+
+            total_uncompressed += max(0, info.file_size)
+            if total_uncompressed > settings.max_batch_uncompressed_bytes:
+                raise ValueError(
+                    "ZIP expands beyond the configured uncompressed-size limit."
+                )
+
+            target = os.path.realpath(os.path.join(destination_root, *relative.parts))
+            if os.path.commonpath([destination_root, target]) != destination_root:
+                raise ValueError(f"Unsafe ZIP destination: {info.filename}")
+            validated.append((info, target))
+
+        for info, target in validated:
+            if info.is_dir():
+                os.makedirs(target, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with archive.open(info, "r") as source, open(target, "wb") as output:
+                shutil.copyfileobj(source, output, length=1024 * 1024)
 
 
 def _parse_selected_classes(classes: Optional[str]) -> list[str]:
@@ -116,14 +191,11 @@ async def predict_single(
     task_dir = get_task_dir(task.task_id)
 
     safe_name = os.path.basename(image.filename or "upload.jpg")
+    if safe_name in {"", ".", ".."}:
+        safe_name = "upload.jpg"
     img_path = os.path.join(task_dir, safe_name)
 
-    contents = await image.read()
-    if not contents:
-        raise HTTPException(status_code=400, detail="Uploaded image is empty.")
-
-    with open(img_path, "wb") as f:
-        f.write(contents)
+    await _save_upload_with_limit(image, img_path)
 
     _validate_image_file(img_path)
 
@@ -187,8 +259,7 @@ def _process_batch(
 
     try:
         with tempfile.TemporaryDirectory() as extract_dir:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(extract_dir)
+            _safe_extract_zip(zip_path, extract_dir)
 
             image_paths = []
             for root, dirs, files in os.walk(extract_dir):
@@ -299,12 +370,7 @@ async def predict_batch(
     task_dir = get_task_dir(task.task_id)
 
     zip_path = os.path.join(task_dir, "upload.zip")
-    contents = await zip_file.read()
-    if not contents:
-        raise HTTPException(status_code=400, detail="Uploaded ZIP file is empty.")
-
-    with open(zip_path, "wb") as f:
-        f.write(contents)
+    await _save_upload_with_limit(zip_file, zip_path)
 
     if not zipfile.is_zipfile(zip_path):
         raise HTTPException(status_code=422, detail="Uploaded file is not a valid ZIP archive.")

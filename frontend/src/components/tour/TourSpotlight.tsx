@@ -11,7 +11,6 @@ import {
   tourIsFirstStepAtom,
   tourIsLastStepAtom,
 } from "@/lib/atoms";
-import type { TourStep } from "@/data/tourSteps";
 import { TourTooltip } from "./TourTooltip";
 
 interface TargetRect {
@@ -74,10 +73,13 @@ export function TourSpotlight() {
 
   // Recalculate on step change
   useEffect(() => {
-    setIsPositioned(false);
+    const resetFrame = requestAnimationFrame(() => setIsPositioned(false));
     // Small delay to let DOM settle after step change
     const timer = setTimeout(updateTargetPosition, 50);
-    return () => clearTimeout(timer);
+    return () => {
+      cancelAnimationFrame(resetFrame);
+      clearTimeout(timer);
+    };
   }, [step, updateTargetPosition]);
 
   // Listen for resize/scroll

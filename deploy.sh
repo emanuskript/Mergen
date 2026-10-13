@@ -13,10 +13,26 @@ NGINX_CONF="/etc/nginx/sites-available/layout-host"
 BACKEND_PORT="8000"
 FRONTEND_PORT="3000"
 BACKEND_MAX_POOL_WORKERS="${BACKEND_MAX_POOL_WORKERS:-1}"
-MODEL_SHARE_BASE_URL="https://owncloud.gwdg.de/remote.php/dav/public-files/PyQ2nN6aKpypKfG/Apps/Layout%20App/model%20weights"
+MODEL_WEIGHTS_BASE_URL="${MODEL_WEIGHTS_BASE_URL:-}"
+SERVICE_USER="${LAYOUT_SERVICE_USER:-$USER}"
+SERVICE_GROUP="${LAYOUT_SERVICE_GROUP:-$(id -gn "$SERVICE_USER")}"
+DATA_DIR="${LAYOUT_DATA_DIR:-/var/lib/layout}"
+ENV_DIR="/etc/layout"
+ENV_FILE="${ENV_DIR}/backend.env"
 TMP_ROOT=""
 PUBLIC_IP=""
+APP_HOST="${APP_HOST:-}"
+PUBLIC_URL="${PUBLIC_URL:-}"
 APP_TITLE="Manuscript Layout Analysis"
+
+if [ "$(id -u)" -eq 0 ]; then
+  echo "ERROR: run this deployment as a normal user with sudo access, not as root." >&2
+  exit 1
+fi
+if [ "$(id -u "$SERVICE_USER")" -eq 0 ]; then
+  echo "ERROR: LAYOUT_SERVICE_USER must be an unprivileged account." >&2
+  exit 1
+fi
 
 cleanup() {
   [ -n "${TMP_ROOT:-}" ] && [ -d "${TMP_ROOT:-}" ] && rm -rf "$TMP_ROOT" || true
@@ -66,6 +82,8 @@ ensure_node_20() {
     curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
     sudo apt-get install -y --no-install-recommends nodejs
   fi
+  major="$(node -v | sed 's/^v//' | cut -d. -f1)"
+  [ "$major" -le 22 ] || fail "Unsupported Node.js $(node -v). Use Node.js 20 or 22 for this release."
 }
 
 check_weights() {
@@ -81,7 +99,7 @@ download_model_weight() {
   local final_file="${target_dir}/${filename}"
 
   curl -fL --retry 3 --retry-delay 2 \
-    "${MODEL_SHARE_BASE_URL}/${filename}" \
+    "${MODEL_WEIGHTS_BASE_URL%/}/${filename}" \
     -o "${tmp_file}"
   mv "${tmp_file}" "${final_file}"
 }
@@ -90,7 +108,8 @@ download_all_model_weights() {
   local target_dir="$1"
   mkdir -p "${target_dir}"
 
-  log "Downloading model weights from OwnCloud share..."
+  [ -n "$MODEL_WEIGHTS_BASE_URL" ] || fail "Model weights are missing. Copy the three .pt files listed in README.md to ${target_dir}, or set MODEL_WEIGHTS_BASE_URL to an authenticated direct-download base URL."
+  log "Downloading model weights from the configured direct-download URL..."
   download_model_weight "best_catmus.pt" "${target_dir}"
   download_model_weight "best_emanuskript_segmentation.pt" "${target_dir}"
   download_model_weight "best_zone_detection.pt" "${target_dir}"
@@ -105,18 +124,10 @@ ensure_model_weights() {
   fi
 }
 
-free_space() {
-  log "Freeing disk space..."
-  sudo apt-get clean || true
-  sudo apt-get autoremove -y || true
-  sudo rm -rf /tmp/* /var/tmp/* || true
-  rm -rf "$HOME/.cache" "$HOME/.npm" || true
+clean_build_artifacts() {
+  log "Removing only this checkout's generated build artifacts..."
   rm -rf "$REPO_DIR/frontend/.next" "$REPO_DIR/frontend/node_modules" || true
   rm -rf "$REPO_DIR/backend/.venv" "$REPO_DIR/.deploy-tmp" || true
-  sudo journalctl --vacuum-time=1d || true
-  if command -v docker >/dev/null 2>&1; then
-    sudo docker system prune -a -f --volumes || true
-  fi
 }
 
 require_space() {
@@ -126,28 +137,60 @@ require_space() {
   [ "$avail_kb" -ge 1500000 ] || fail "Need at least ~1.5 GB free on / before deployment."
 }
 
-disable_conflicting_services() {
-  log "Disabling conflicting web services..."
+check_conflicting_services() {
   for svc in caddy apache2; do
-    if systemctl list-unit-files 2>/dev/null | grep -q "^${svc}\.service"; then
-      sudo systemctl stop "$svc" || true
-      sudo systemctl disable "$svc" || true
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+      fail "${svc}.service is using the web ports. Stop or reconfigure it explicitly before deploying Mergen; this script will not disable unrelated services."
     fi
   done
 }
 
-disable_old_public_configs() {
-  log "Disabling old public nginx configs..."
-  sudo mkdir -p /etc/nginx/disabled-by-layout
-  sudo rm -f /etc/nginx/sites-enabled/* || true
+prepare_runtime_config() {
+  local jwt_secret analytics_password analytics_username
+  jwt_secret="${JWT_SECRET:-}"
+  analytics_password="${ANALYTICS_PASSWORD:-}"
+  analytics_username="${ANALYTICS_USERNAME:-}"
 
-  while IFS= read -r -d '' f; do
-    if sudo grep -qiE 'duckdns\.org|thelayout|layout\.duckdns|thelayout\.duckdns' "$f"; then
-      sudo mv "$f" "/etc/nginx/disabled-by-layout/$(basename "$f").bak.$(date +%s)" || true
-    fi
-  done < <(sudo find /etc/nginx \
-    \( -path "/etc/nginx/sites-available/*" -o -path "/etc/nginx/conf.d/*" \) \
-    \( -type f -o -type l \) -print0 2>/dev/null)
+  # Preserve generated credentials across safe re-runs unless the operator
+  # explicitly supplies replacements.
+  if sudo test -f "$ENV_FILE"; then
+    [ -n "$jwt_secret" ] || jwt_secret="$(sudo awk -F= '$1 == "JWT_SECRET" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+    [ -n "$analytics_password" ] || analytics_password="$(sudo awk -F= '$1 == "ANALYTICS_PASSWORD" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+    [ -n "$analytics_username" ] || analytics_username="$(sudo awk -F= '$1 == "ANALYTICS_USERNAME" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+  fi
+  jwt_secret="${jwt_secret:-$(openssl rand -hex 32)}"
+  analytics_password="${analytics_password:-$(openssl rand -base64 24 | tr -d '\n')}"
+  analytics_username="${analytics_username:-admin}"
+
+  sudo install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DATA_DIR" "${DATA_DIR}/tasks"
+  sudo install -d -m 0750 "$ENV_DIR"
+  sudo tee "$ENV_FILE" >/dev/null <<EOF
+APP_ENV=production
+MODEL_DIR=${REPO_DIR}/backend/models
+TASK_BASE_DIR=${DATA_DIR}/tasks
+ANALYTICS_DB_PATH=${DATA_DIR}/analytics.db
+CORS_ORIGINS=${PUBLIC_URL}
+MAX_POOL_WORKERS=${BACKEND_MAX_POOL_WORKERS}
+TASK_TTL_MINUTES=${TASK_TTL_MINUTES:-60}
+TASK_CLEANUP_INTERVAL_SECONDS=${TASK_CLEANUP_INTERVAL_SECONDS:-300}
+MAX_UPLOAD_BYTES=${MAX_UPLOAD_BYTES:-209715200}
+MAX_BATCH_ENTRIES=${MAX_BATCH_ENTRIES:-1000}
+MAX_BATCH_UNCOMPRESSED_BYTES=${MAX_BATCH_UNCOMPRESSED_BYTES:-1073741824}
+JWT_SECRET=${jwt_secret}
+ANALYTICS_USERNAME=${analytics_username}
+ANALYTICS_PASSWORD=${analytics_password}
+OMP_NUM_THREADS=1
+OPENBLAS_NUM_THREADS=1
+MKL_NUM_THREADS=1
+NUMEXPR_NUM_THREADS=1
+PYTHONDONTWRITEBYTECODE=1
+PYTHONUNBUFFERED=1
+XDG_CONFIG_HOME=${DATA_DIR}/.config
+MPLCONFIGDIR=${DATA_DIR}/.cache/matplotlib
+EOF
+  sudo chmod 0600 "$ENV_FILE"
+  sudo install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
+    "${DATA_DIR}/.config" "${DATA_DIR}/.cache/matplotlib"
 }
 
 write_backend_service() {
@@ -158,19 +201,22 @@ After=network.target
 
 [Service]
 Type=simple
-User=${USER}
+User=${SERVICE_USER}
 WorkingDirectory=${REPO_DIR}/backend
-Environment=MODEL_DIR=${REPO_DIR}/backend/models
-Environment=CORS_ORIGINS=http://${PUBLIC_IP}
-Environment=MAX_POOL_WORKERS=${BACKEND_MAX_POOL_WORKERS}
-Environment=OMP_NUM_THREADS=1
-Environment=OPENBLAS_NUM_THREADS=1
-Environment=MKL_NUM_THREADS=1
-Environment=NUMEXPR_NUM_THREADS=1
-Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=${ENV_FILE}
 ExecStart=${REPO_DIR}/backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port ${BACKEND_PORT} --workers 1
 Restart=always
 RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=${DATA_DIR}
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -186,15 +232,26 @@ Requires=${BACKEND_SERVICE}.service
 
 [Service]
 Type=simple
-User=${USER}
+User=${SERVICE_USER}
 WorkingDirectory=${REPO_DIR}/frontend/.next/standalone
 Environment=NODE_ENV=production
+Environment=NEXT_TELEMETRY_DISABLED=1
 Environment=PORT=${FRONTEND_PORT}
 Environment=HOSTNAME=127.0.0.1
 Environment=INTERNAL_BACKEND_URL=http://127.0.0.1:${BACKEND_PORT}
 ExecStart=/usr/bin/env node server.js
 Restart=always
 RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=${REPO_DIR}/frontend/.next/standalone/.next/cache
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target
@@ -204,11 +261,15 @@ EOF
 write_nginx_config() {
   sudo tee "$NGINX_CONF" >/dev/null <<EOF
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-    server_name _;
+    listen 80;
+    listen [::]:80;
+    server_name ${APP_HOST};
 
     client_max_body_size 200M;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
 
     location = /api {
         return 301 /api/;
@@ -267,14 +328,14 @@ verify_local_frontend() {
 }
 
 verify_local_nginx() {
-  curl -fsS "http://127.0.0.1" | grep -q "${APP_TITLE}" \
+  curl -fsS -H "Host: ${APP_HOST}" "http://127.0.0.1" | grep -q "${APP_TITLE}" \
     || fail "Local nginx is not serving the expected frontend."
 }
 
 verify_api() {
-  curl -fsS "http://127.0.0.1/api/health" >/dev/null \
+  curl -fsS -H "Host: ${APP_HOST}" "http://127.0.0.1/api/health" >/dev/null \
     || fail "nginx -> backend health route is broken."
-  curl -fsS "http://127.0.0.1/api/classes" >/dev/null \
+  curl -fsS -H "Host: ${APP_HOST}" "http://127.0.0.1/api/classes" >/dev/null \
     || fail "nginx -> backend classes route is broken."
 }
 
@@ -283,6 +344,7 @@ run_prediction_request() {
   local response_file="$2"
 
   curl -sS -o "${response_file}" -w "%{http_code}" -X POST \
+    -H "Host: ${APP_HOST}" \
     -F "image=@${smoke_image}" \
     -F "confidence=0.25" \
     -F "iou=0.3" \
@@ -338,23 +400,23 @@ PY
   [ -n "$task_id" ] || fail "Prediction response did not include a task_id."
   [ -n "$annotated_path" ] || fail "Prediction response did not include annotated_image_url."
 
-  curl -fsS "http://127.0.0.1${annotated_path}" -o /dev/null -D - | grep -qi '^content-type: image/jpeg' \
+  curl -fsS -H "Host: ${APP_HOST}" "http://127.0.0.1${annotated_path}" -o /dev/null -D - | grep -qi '^content-type: image/jpeg' \
     || fail "Predicted annotated image is not reachable through nginx."
 }
 
 verify_public_route() {
-  if curl -fsS "http://${PUBLIC_IP}" | grep -q "${APP_TITLE}"; then
-    log "Public IP is serving the expected frontend."
+  if curl -fsS "${PUBLIC_URL}" | grep -q "${APP_TITLE}"; then
+    log "Public URL is serving the expected frontend."
   else
     echo
-    echo "!! Local deployment is correct, but public IP is not serving the same frontend."
+    echo "!! Local deployment is correct, but ${PUBLIC_URL} is not serving the same frontend."
   fi
 }
 
 log "Installing base packages..."
 sudo apt-get update -y
 sudo apt-get install -y --no-install-recommends \
-  ca-certificates curl git nginx python3 python3-pip python3-venv \
+  ca-certificates curl git nginx openssl python3 python3-pip python3-venv \
   build-essential libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
   libspatialindex-dev
 
@@ -366,18 +428,30 @@ if [ -z "$REPO_DIR" ]; then
 fi
 cd "$REPO_DIR"
 
+if [ -n "$(git status --porcelain)" ]; then
+  fail "Deploy only from a clean, committed Mergen checkout. Preserve or commit local changes first."
+fi
+
 ensure_node_20
 
 log "Ensuring model weights are present..."
 ensure_model_weights
 
-PUBLIC_IP="$(detect_public_ip)"
-[ -n "$PUBLIC_IP" ] || fail "Unable to detect public IP."
+if [ -z "$APP_HOST" ]; then
+  PUBLIC_IP="$(detect_public_ip)"
+  [ -n "$PUBLIC_IP" ] || fail "Unable to detect public IP; set APP_HOST explicitly."
+  APP_HOST="$PUBLIC_IP"
+fi
+PUBLIC_URL="${PUBLIC_URL:-http://${APP_HOST}}"
+[[ "${APP_HOST}" =~ ^[A-Za-z0-9.-]+$ ]] \
+  || fail "APP_HOST must be a DNS hostname or IPv4 address."
+[[ "${PUBLIC_URL}" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?$ ]] \
+  || fail "PUBLIC_URL must be one http(s) origin without a path."
 
-free_space
+clean_build_artifacts
 require_space
-disable_conflicting_services
-disable_old_public_configs
+check_conflicting_services
+prepare_runtime_config
 
 TMP_ROOT="${REPO_DIR}/.deploy-tmp"
 mkdir -p "$TMP_ROOT"
@@ -399,11 +473,7 @@ log "Validating backend model checkpoints..."
 MODEL_DIR="${REPO_DIR}/backend/models" \
   "$REPO_DIR/backend/.venv/bin/python" -m app.scripts.validate_models \
   || {
-    log "Model validation failed; re-downloading all weights from OwnCloud share..."
-    download_all_model_weights "${REPO_DIR}/backend/models"
-    MODEL_DIR="${REPO_DIR}/backend/models" \
-      "$REPO_DIR/backend/.venv/bin/python" -m app.scripts.validate_models \
-      || fail "One or more model checkpoints are invalid even after re-download."
+    fail "One or more model checkpoints are invalid. Replace them from the README source; the script will not silently overwrite supplied weights."
   }
 
 log "Building frontend..."
@@ -414,29 +484,53 @@ if [ -f package-lock.json ]; then
 else
   TMPDIR="$TMP_ROOT" npm install --cache "$TMP_ROOT/.npm-cache"
 fi
+npm audit --omit=dev --audit-level=high
 INTERNAL_BACKEND_URL="http://127.0.0.1:${BACKEND_PORT}" TMPDIR="$TMP_ROOT" npm run build
 mkdir -p .next/standalone/.next
 rm -rf .next/standalone/.next/static .next/standalone/public
 cp -R .next/static .next/standalone/.next/static
 cp -R public .next/standalone/public
+mkdir -p .next/standalone/.next/cache
+sudo chown -R "$SERVICE_USER:$SERVICE_GROUP" .next/standalone/.next/cache
+rm -rf "$REPO_DIR/frontend/node_modules"
 cd "$REPO_DIR"
 
 log "Writing services and nginx config..."
 write_backend_service
 write_frontend_service
+
+NGINX_BACKUP="${TMP_ROOT}/nginx.previous"
+NGINX_CONFIG_EXISTED=false
+NGINX_SITE_WAS_ENABLED=false
+if sudo test -f "$NGINX_CONF"; then
+  sudo cat "$NGINX_CONF" > "$NGINX_BACKUP"
+  NGINX_CONFIG_EXISTED=true
+fi
+if sudo test -e /etc/nginx/sites-enabled/layout-host \
+  || sudo test -L /etc/nginx/sites-enabled/layout-host; then
+  NGINX_SITE_WAS_ENABLED=true
+fi
 write_nginx_config
 sudo ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/layout-host
+if ! sudo nginx -t; then
+  if [ "$NGINX_CONFIG_EXISTED" = true ]; then
+    sudo install -m 0644 "$NGINX_BACKUP" "$NGINX_CONF"
+  else
+    sudo rm -f "$NGINX_CONF"
+  fi
+  if [ "$NGINX_SITE_WAS_ENABLED" != true ]; then
+    sudo rm -f /etc/nginx/sites-enabled/layout-host
+  fi
+  sudo nginx -t || true
+  fail "New nginx configuration is invalid; the previous configuration was restored."
+fi
 
 log "Restarting services..."
 sudo systemctl daemon-reload
 sudo systemctl enable "$BACKEND_SERVICE" "$FRONTEND_SERVICE" nginx
 sudo systemctl stop "$FRONTEND_SERVICE" || true
-sudo pkill -f "next.*3000" || true
-sudo pkill -f "next-server" || true
-sudo pkill -f "next start" || true
 sudo systemctl restart "$BACKEND_SERVICE"
 sudo systemctl start "$FRONTEND_SERVICE"
-sudo nginx -t
 sudo systemctl restart nginx
 
 sleep 3
@@ -453,6 +547,8 @@ verify_public_route
 
 echo
 echo "==> Deployment complete"
-echo "Frontend URL: http://${PUBLIC_IP}"
+echo "Frontend URL: ${PUBLIC_URL}"
 echo "Backend local: http://127.0.0.1:${BACKEND_PORT}"
 echo "Services: ${BACKEND_SERVICE}, ${FRONTEND_SERVICE}, nginx"
+echo "Secrets file: ${ENV_FILE} (root-readable only)"
+echo "For public production, terminate TLS at nginx or an upstream proxy and set PUBLIC_URL=https://your-domain before rerunning."

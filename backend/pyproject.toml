@@ -14,7 +14,7 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
     "python-multipart>=0.0.18",
-    "python-jose[cryptography]>=3.3.0",
+    "PyJWT>=2.10.1",
     "pydantic-settings>=2.0.0",
     "ultralytics>=8.0.0",
     "numpy<2.0",

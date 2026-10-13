@@ -18,7 +18,11 @@ export function PanZoomImage({ src, alt }: PanZoomImageProps) {
   const imgRef = useRef<HTMLImageElement | null>(null);
   const tRef = useRef<Transform>({ scale: 1, offsetX: 0, offsetY: 0 });
   const panRef = useRef({ active: false, dragged: false, startX: 0, startY: 0, origOX: 0, origOY: 0 });
-  const [, forceRender] = useState(0);
+  const [renderedTransform, setRenderedTransform] = useState<Transform>({
+    scale: 1,
+    offsetX: 0,
+    offsetY: 0,
+  });
   const DRAG_THRESHOLD = 4;
 
   const fitToView = useCallback(() => {
@@ -27,12 +31,13 @@ export function PanZoomImage({ src, alt }: PanZoomImageProps) {
     if (!container || !img || !img.naturalWidth) return;
     const { width: cw, height: ch } = container.getBoundingClientRect();
     const scale = Math.min(cw / img.naturalWidth, ch / img.naturalHeight, 1);
-    tRef.current = {
+    const transform = {
       scale,
       offsetX: (cw - img.naturalWidth * scale) / 2,
       offsetY: (ch - img.naturalHeight * scale) / 2,
     };
-    forceRender((n) => n + 1);
+    tRef.current = transform;
+    setRenderedTransform(transform);
   }, []);
 
   // Fit on load and resize
@@ -46,7 +51,8 @@ export function PanZoomImage({ src, alt }: PanZoomImageProps) {
 
   // Reset fit when src changes
   useEffect(() => {
-    tRef.current = { scale: 1, offsetX: 0, offsetY: 0 };
+    const transform = { scale: 1, offsetX: 0, offsetY: 0 };
+    tRef.current = transform;
     // fitToView will fire via onLoad
   }, [src]);
 
@@ -62,12 +68,13 @@ export function PanZoomImage({ src, alt }: PanZoomImageProps) {
       const t = tRef.current;
       const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
       const newScale = Math.min(Math.max(t.scale * factor, 0.05), 30);
-      tRef.current = {
+      const transform = {
         scale: newScale,
         offsetX: mx - (mx - t.offsetX) * (newScale / t.scale),
         offsetY: my - (my - t.offsetY) * (newScale / t.scale),
       };
-      forceRender((n) => n + 1);
+      tRef.current = transform;
+      setRenderedTransform(transform);
     };
     container.addEventListener("wheel", onWheel, { passive: false });
     return () => container.removeEventListener("wheel", onWheel);
@@ -96,12 +103,13 @@ export function PanZoomImage({ src, alt }: PanZoomImageProps) {
       p.dragged = true;
     }
     if (p.dragged) {
-      tRef.current = {
+      const transform = {
         ...tRef.current,
         offsetX: p.origOX + dx,
         offsetY: p.origOY + dy,
       };
-      forceRender((n) => n + 1);
+      tRef.current = transform;
+      setRenderedTransform(transform);
     }
   };
 
@@ -112,8 +120,6 @@ export function PanZoomImage({ src, alt }: PanZoomImageProps) {
   const handleMouseLeave = () => {
     panRef.current = { ...panRef.current, active: false, dragged: false };
   };
-
-  const t = tRef.current;
 
   return (
     <div
@@ -134,7 +140,7 @@ export function PanZoomImage({ src, alt }: PanZoomImageProps) {
         className="absolute left-0 top-0 max-w-none"
         style={{
           transformOrigin: "0 0",
-          transform: `translate(${t.offsetX}px, ${t.offsetY}px) scale(${t.scale})`,
+          transform: `translate(${renderedTransform.offsetX}px, ${renderedTransform.offsetY}px) scale(${renderedTransform.scale})`,
         }}
         draggable={false}
       />

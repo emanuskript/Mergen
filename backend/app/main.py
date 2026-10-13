@@ -1,6 +1,7 @@
 import logging
 import multiprocessing as mp
 import os
+import asyncio
 
 from contextlib import asynccontextmanager
 
@@ -10,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.routers import analytics, classes, download, health, predict
 from app.services.inference import init_model_pool, shutdown_model_pool
+from app.services.file_manager import cleanup_expired_tasks
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +63,25 @@ async def lifespan(app: FastAPI):
     except RuntimeError:
         pass
 
+    settings.validate_production_security()
     _log_startup_checks()
     init_model_pool()
-    yield
-    shutdown_model_pool()
+
+    async def cleanup_loop():
+        while True:
+            cleanup_expired_tasks()
+            await asyncio.sleep(max(30, settings.task_cleanup_interval_seconds))
+
+    cleanup_task = asyncio.create_task(cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+        shutdown_model_pool()
 
 
 app = FastAPI(

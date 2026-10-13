@@ -73,5 +73,14 @@ def cleanup_expired_tasks():
         expired = [tid for tid, t in _task_store.items() if t.created_at < cutoff]
         for tid in expired:
             del _task_store[tid]
-            task_dir = os.path.join(TASK_BASE_DIR, tid)
-            shutil.rmtree(task_dir, ignore_errors=True)
+
+    # Also remove orphaned directories left by restarts. Task state is held in
+    # memory, so relying only on _task_store would leak every pre-restart job.
+    if not os.path.isdir(TASK_BASE_DIR):
+        return
+    for entry in os.scandir(TASK_BASE_DIR):
+        try:
+            if entry.is_dir(follow_symlinks=False) and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry.path, ignore_errors=True)
+        except OSError:
+            continue
