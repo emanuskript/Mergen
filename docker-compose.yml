@@ -66,6 +66,8 @@ services:
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?Set SITE_ADDRESS to the public domain name}
     depends_on:
       backend:
         condition: service_healthy
